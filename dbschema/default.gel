@@ -1,0 +1,189 @@
+module default {
+  # ---------- enums ----------
+  scalar type SpecType        extending enum<OPENAPI, REQUIREMENTS_DOC>;
+  # HTTP verbs are reserved words in Gel, hence the backticks.
+  scalar type HttpMethod      extending enum<`GET`, `POST`, `PUT`, `PATCH`, `DELETE`, `HEAD`, `OPTIONS`>;
+  scalar type TestCaseType    extending enum<POSITIVE, NEGATIVE, BOUNDARY, SECURITY, RBAC>;
+  scalar type Priority        extending enum<P0, P1, P2>;
+  scalar type DesignStatus    extending enum<DRAFT, READY, NEEDS_REVIEW, DEPRECATED>;
+  scalar type GenStatus       extending enum<PENDING, GENERATED, FAILED_GEN>;
+  scalar type StepType        extending enum<HTTP, DELAY>;
+  scalar type RunStatus       extending enum<PENDING, RUNNING, COMPLETED, ABORTED>;
+  scalar type ExecutionStatus extending enum<PASSED, FAILED, ERROR, TIMEOUT, SKIPPED>;
+
+  abstract type Timestamped {
+    required created_at: datetime { default := datetime_current(); readonly := true; }
+    updated_at: datetime;
+  }
+
+  # ---------- specifications ----------
+  type FeatureSpec extending Timestamped {
+    required name: str;
+    required spec_type: SpecType;
+    required version: str;
+    required source_path: str;
+    required raw_content: str;
+    required content_hash: str { constraint exclusive; }   # idempotent re-ingest
+    previous: FeatureSpec;                                 # prior version of the same spec name
+    multi link endpoints := .<spec[is ApiEndpoint];
+    multi link requirements := .<spec[is Requirement];
+    constraint exclusive on ((.name, .version));
+  }
+
+  type ApiEndpoint {
+    required spec: FeatureSpec { on target delete delete source; }
+    required method: HttpMethod;
+    required path: str;                  # OpenAPI path, e.g. /v1/orders/{orderId}
+    operation_id: str;
+    summary: str;
+    tag: str;
+    parameters: json;
+    request_schema: json;
+    response_schemas: json;              # {"201": {"description": ..., "schema": ...}}
+    required contract_hash: str;         # hash of params + request + response schemas
+    property key := <str>.method ++ ' ' ++ .path;
+    constraint exclusive on ((.spec, .method, .path));
+  }
+
+  type Requirement extending Timestamped {
+    required spec: FeatureSpec { on target delete delete source; }
+    required req_id: str;                # PRD-ORD-42
+    required description: str;
+    acceptance_criteria: array<str>;
+    multi endpoints: ApiEndpoint;        # PRD <-> OpenAPI correlation
+    constraint exclusive on ((.spec, .req_id));
+  }
+
+  type Analysis extending Timestamped {
+    required analysis_id: str { constraint exclusive; }
+    required multi specs: FeatureSpec;
+    required summary: str;
+    modules: json;
+    correlations: json;
+    conflicts: json;                     # spec-vs-spec contradictions
+    gaps: json;                          # PRD features without endpoints, etc.
+    changes: json;                       # diff vs previous spec versions
+    model_name: str;
+  }
+
+  # ---------- test design (IR) ----------
+  # `module` is a reserved word, hence `test_module` for the back-references.
+  type TestModule extending Timestamped {   # module block = one folder in the Bruno collection
+    required code: str { constraint exclusive; constraint regexp(r'^[A-Z][A-Z0-9_]*$'); }    # ORD
+    required folder: str { constraint exclusive; constraint regexp(r'^[a-z][a-z0-9-]*$'); }  # orders
+    required domain: str;
+    target_spec: FeatureSpec;
+    product_spec: FeatureSpec;
+    analysis: Analysis;
+    base_path: str;
+    default_headers: json;
+    default_preconditions: array<str>;
+    required next_case_seq: int32 { default := 1; }   # code-assigned TC-<CODE>-NNN
+    multi link test_cases := .<test_module[is TestCase];
+    multi link actors     := .<test_module[is Actor];
+    multi link fixtures   := .<test_module[is Fixture];
+  }
+
+  type Actor {
+    required test_module: TestModule { on target delete delete source; }
+    required name: str;                  # customer_standard
+    description: str;
+    auth: json;                          # {"type": "bearer", "token": "{{ $env.CUSTOMER_TOKEN }}"}
+    constraint exclusive on ((.test_module, .name));
+  }
+
+  type Fixture {
+    required test_module: TestModule { on target delete delete source; }
+    required name: str;                  # active_sku
+    value: json;                         # literal, or {"env": "ACTIVE_SKU"}
+    description: str;
+    constraint exclusive on ((.test_module, .name));
+  }
+
+  type TestCase extending Timestamped {
+    required test_id: str { constraint exclusive; constraint regexp(r'^TC-[A-Z][A-Z0-9_]*-\d{3,}$'); }
+    required test_module: TestModule { on target delete delete source; }
+    required title: str;
+    required case_type: TestCaseType;
+    required priority: Priority;
+    required design_status: DesignStatus { default := DesignStatus.DRAFT; }
+    required gen_status: GenStatus { default := GenStatus.PENDING; }
+    review_reason: str;                  # set together with NEEDS_REVIEW
+    required fingerprint: str;           # hash(module, endpoints, case_type, title) for dedup
+    tags: array<str>;
+    actor: Actor;
+    multi requirements: Requirement;     # coverage.requirement_refs
+    preconditions: array<str>;
+    variables: json;                     # {"idempotency_key": "{{ $faker.uuid }}"}
+    parameters: json;                    # data-driven rows, each with a "name" slug
+    expected_results: array<str>;
+    multi link steps := .<test_case[is TestStep];
+    multi link endpoints := distinct .steps.endpoint;   # coverage, computed from steps
+    multi link executions := .<test_case[is TestExecution];
+    # generation bookkeeping (LLM synthesizer)
+    script_path: str;                    # relative to test_generated/bruno/ (first file of the case)
+    script_hash: str;
+    ir_hash: str;                        # hash of the IR the files were generated from
+    required generation_attempts: int16 { default := 0; }
+    gen_model: str;
+    last_gen_error: str;
+  }
+
+  type TestStep {
+    required test_case: TestCase { on target delete delete source; }
+    required seq: int16;                 # execution order within the case
+    required is_cleanup: bool { default := false; }   # cleanup failures don't fail the case
+    required name: str;
+    required step_type: StepType { default := StepType.HTTP; }
+    endpoint: ApiEndpoint;               # resolved coverage link
+    method: HttpMethod;
+    path: str;                           # may contain {{ $extract.order_id }}
+    request: json;                       # {"headers": {}, "query": {}, "path_params": {}, "payload": ...}
+    expected_status: str;                # "201" | "{{ $param.expected_status }}"
+    validate_schema: bool { default := false; }
+    extract: json;                       # {"order_id": "response.body.data.id"}
+    assertions: json;                    # [{"check": "...", "message": "..."}]
+    poll: json;                          # stored; rendering deferred
+    delay_ms: int32;
+    timeout_ms: int32;
+    constraint exclusive on ((.test_case, .seq));
+  }
+
+  # ---------- execution ----------
+  type TestEngine {
+    required name: str { constraint exclusive; }   # "bruno"
+    required file_extension: str;                  # ".yml"
+    required default_command: str;
+    version: str;
+    required is_active: bool { default := true; }
+  }
+
+  type TestRun extending Timestamped {
+    required run_id: str { constraint exclusive; }
+    multi modules: TestModule;
+    required engine: TestEngine;
+    required status: RunStatus { default := RunStatus.PENDING; }
+    env_name: str;
+    base_url: str;
+    started_at: datetime;
+    finished_at: datetime;
+    log_prefix_uri: str;                 # s3://spec-run-telemetry/runs/<run_id>/
+    abort_reason: str;                   # e.g. pre-flight health check failure
+    multi link executions := .<run[is TestExecution];
+  }
+
+  type TestExecution extending Timestamped {
+    required run: TestRun { on target delete delete source; }
+    required test_case: TestCase { on target delete delete source; }
+    required param_index: int16 { default := 0; }   # 0=a, 1=b, ...
+    required status: ExecutionStatus;
+    duration_ms: int64;
+    http_status: int16;
+    failed_assertions: json;
+    error_message: str;
+    log_uri: str;                        # s3://.../runs/<run_id>/<test_id>/<param>/
+    script_hash: str;                    # which script revision ran
+    constraint exclusive on ((.run, .test_case, .param_index));
+  }
+  # DiagnosticNote / DiagnosticCategory are added by migration when the diagnostics agent is built.
+}

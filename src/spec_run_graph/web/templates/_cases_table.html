@@ -1,0 +1,21 @@
+<p class="muted small">{{ rows | length }} cases</p>
+<div class="table-wrap">
+<table>
+  <thead><tr><th>Id</th><th>Title</th><th>Type</th><th>Prio</th><th>Status</th><th>Build</th><th>Endpoints</th><th>Reqs</th><th>Last result</th></tr></thead>
+  <tbody>
+  {% for c in rows %}
+  <tr>
+    <td><a href="/cases/{{ c.test_id }}">{{ c.test_id }}</a></td>
+    <td>{{ c.title }}{% if c.tags %}<div class="tags">{% for t in c.tags %}<span class="tag">{{ t }}</span>{% endfor %}</div>{% endif %}</td>
+    <td>{{ c.case_type }}</td><td>{{ c.priority }}</td>
+    <td><span class="pill {{ c.design_status | lower }}">{{ c.design_status }}</span>
+      {% if c.review_reason %}<div class="small warn">{{ c.review_reason }}</div>{% endif %}</td>
+    <td><span class="pill {{ c.gen_status | lower }}">{{ c.gen_status }}</span></td>
+    <td class="small mono">{% for e in c.endpoints %}{{ e.key }}<br>{% endfor %}</td>
+    <td class="small">{{ c.requirements | map(attribute="req_id") | join(", ") }}</td>
+    <td>{% if c.last %}<span class="pill {{ c.last.status | lower }}">{{ c.last.status }}</span> <span class="small muted">{{ c.last.http_status or "" }}</span>{% else %}<span class="muted">-</span>{% endif %}</td>
+  </tr>
+  {% else %}<tr><td colspan="9" class="muted">No test cases - <code>srg plan specs/</code></td></tr>{% endfor %}
+  </tbody>
+</table>
+</div>

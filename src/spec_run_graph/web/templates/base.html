@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>SpecRunGraph</title>
+  <link rel="stylesheet" href="/static/app.css">
+  <script src="https://unpkg.com/htmx.org@2.0.4" defer></script>
+</head>
+<body>
+<header class="topbar">
+  <a class="brand" href="/">SpecRunGraph</a>
+  <nav>
+    <a href="/" class="{{ 'active' if page == 'overview' }}">Overview</a>
+    <a href="/cases" class="{{ 'active' if page == 'cases' }}">Test cases</a>
+    <a href="/endpoints" class="{{ 'active' if page == 'endpoints' }}">Coverage</a>
+    <a href="/runs" class="{{ 'active' if page == 'runs' }}">Runs</a>
+  </nav>
+  <button class="chat-toggle" onclick="document.body.classList.toggle('chat-open')">Ask</button>
+</header>
+<div class="layout">
+  <main>{% block content %}{% endblock %}</main>
+  <aside class="chat" aria-label="QA chatbot">
+    <div class="chat-head">
+      <strong>QA assistant</strong>
+      <span class="muted small">{{ model }}</span>
+      <button class="link small" onclick="resetChat()">clear</button>
+    </div>
+    <div id="chat-log" class="chat-log">
+      <div class="msg bot">Ask about the knowledge base, e.g. <em>How many test cases do we have?</em>,
+        <em>Which endpoints have no negative tests?</em>, <em>What failed in the last run?</em></div>
+    </div>
+    <form id="chat-form" class="chat-form" onsubmit="return sendChat(event)">
+      <textarea id="chat-input" rows="2" placeholder="Ask a question..." required></textarea>
+      <button type="submit">Send</button>
+    </form>
+  </aside>
+</div>
+<script src="/static/chat.js"></script>
+</body>
+</html>

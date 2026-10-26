@@ -1,0 +1,36 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>Coverage</h1>
+<section class="card">
+  <h3>Endpoints × case type</h3>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Endpoint</th><th>Spec</th>{% for t in types %}<th class="num">{{ t | lower }}</th>{% endfor %}<th class="num">total</th></tr></thead>
+    <tbody>
+    {% for e in eps %}
+    <tr class="{{ 'uncovered' if e.total == 0 }}">
+      <td class="mono"><a href="/cases?endpoint={{ e.key | urlencode }}">{{ e.key }}</a><div class="small muted">{{ e.summary or "" }}</div></td>
+      <td class="small">{{ e.spec_name }} v{{ e.spec_version }}</td>
+      {% for t in types %}<td class="num {{ 'zero' if not e.by_type.get(t) }}">{{ e.by_type.get(t, 0) }}</td>{% endfor %}
+      <td class="num"><strong>{{ e.total }}</strong></td>
+    </tr>
+    {% else %}<tr><td colspan="8" class="muted">No endpoints - <code>srg plan specs/</code></td></tr>{% endfor %}
+    </tbody>
+  </table></div>
+</section>
+<section class="card">
+  <h3>Requirements</h3>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Requirement</th><th>Description</th><th>Endpoints</th><th>Test cases</th></tr></thead>
+    <tbody>
+    {% for r in reqs %}
+    <tr class="{{ 'uncovered' if not r.cases }}">
+      <td><strong>{{ r.req_id }}</strong><div class="small muted">{{ r.spec_name }}</div></td>
+      <td class="small">{{ r.description }}</td>
+      <td class="small mono">{% for e in r.endpoints %}{{ e.key }}<br>{% else %}<span class="warn">no endpoint</span>{% endfor %}</td>
+      <td class="small">{% for c in r.cases %}<a href="/cases/{{ c.test_id }}">{{ c.test_id }}</a> {% else %}<span class="err">not covered</span>{% endfor %}</td>
+    </tr>
+    {% endfor %}
+    </tbody>
+  </table></div>
+</section>
+{% endblock %}

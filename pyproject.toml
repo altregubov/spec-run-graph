@@ -1,0 +1,56 @@
+[project]
+name = "spec-run-graph"
+version = "0.1.0"
+description = "Spec-driven API test generation and execution: OpenAPI + PRD -> Gel -> Bruno (OpenCollection)"
+readme = "README.md"
+requires-python = ">=3.12,<3.14"
+dependencies = [
+    "pydantic>=2.9",
+    "pydantic-settings>=2.6",
+    "pydantic-ai-slim[openai]>=1.0",
+    "pydantic-graph>=1.0",
+    "gel>=3.0",
+    "aioboto3>=13.0",
+    "httpx>=0.27",
+    "typer>=0.12",
+    "rich>=13.9",
+    "pyyaml>=6.0",
+    "jsonschema>=4.23",
+    "fastapi>=0.115",
+    "uvicorn>=0.32",
+    "jinja2>=3.1",
+    "sse-starlette>=2.1",
+]
+
+[project.scripts]
+srg = "spec_run_graph.cli:app"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3",
+    "pytest-asyncio>=0.24",
+    "ruff>=0.7",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/spec_run_graph"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py312"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "SIM"]
+ignore = ["B008", "E501"]  # long prompt strings; code is wrapped by ruff format
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "module"
+asyncio_default_test_loop_scope = "module"
+markers = ["integration: requires docker services (Gel, MinIO), bru and the example SUT"]

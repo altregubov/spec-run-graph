@@ -1,0 +1,37 @@
+{
+ "orders/TC-ORD-001-step1-submit-draft-order-creation-request.yml": {
+  "file_step": 1,
+  "is_cleanup": false,
+  "param_index": 0,
+  "step_seq": 1,
+  "test_id": "TC-ORD-001"
+ },
+ "orders/TC-ORD-001-step2-delete-created-order.yml": {
+  "file_step": 2,
+  "is_cleanup": true,
+  "param_index": 0,
+  "step_seq": 2,
+  "test_id": "TC-ORD-001"
+ },
+ "orders/TC-ORD-002a-zero-quantity.yml": {
+  "file_step": 1,
+  "is_cleanup": false,
+  "param_index": 0,
+  "step_seq": 1,
+  "test_id": "TC-ORD-002"
+ },
+ "orders/TC-ORD-002b-negative-quantity.yml": {
+  "file_step": 1,
+  "is_cleanup": false,
+  "param_index": 1,
+  "step_seq": 1,
+  "test_id": "TC-ORD-002"
+ },
+ "orders/TC-ORD-002c-over-max-quantity.yml": {
+  "file_step": 1,
+  "is_cleanup": false,
+  "param_index": 2,
+  "step_seq": 1,
+  "test_id": "TC-ORD-002"
+ }
+}

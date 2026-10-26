@@ -1,0 +1,386 @@
+[
+  {
+    "iterationIndex": 0,
+    "results": [
+      {
+        "test": {
+          "filename": "orders/TC-ORD-001-step1-submit-draft-order-creation-request.yml"
+        },
+        "request": {
+          "method": "POST",
+          "url": "http://localhost:8000/v1/orders",
+          "headers": {
+            "User-Agent": "bruno-runtime/4.3.0",
+            "Content-Length": "46",
+            "Accept-Encoding": "gzip, compress, deflate, br",
+            "Host": "localhost:8000",
+            "Connection": "keep-alive",
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+            "Idempotency-Key": "3e576315-3d94-4bc3-920e-4dc3d038c3f7",
+            "Authorization": "Bearer ********"
+          },
+          "data": "{\"items\": [{\"qty\": 1, \"sku\": \"SKU-ACTIVE-1\"}]}"
+        },
+        "response": {
+          "status": 201,
+          "statusText": "Created",
+          "headers": {
+            "date": "Sun, 25 Oct 2026 18:31:32 GMT",
+            "server": "uvicorn",
+            "content-length": "144",
+            "content-type": "application/json"
+          },
+          "data": {
+            "data": {
+              "id": "a9c4fbad-10ad-43c9-b910-e8055a003e63",
+              "status": "DRAFT",
+              "items": [
+                {
+                  "sku": "SKU-ACTIVE-1",
+                  "qty": 1
+                }
+              ],
+              "total": 12.5,
+              "owner": "customer"
+            }
+          },
+          "url": "http://localhost/v1/orders",
+          "responseTime": 9,
+          "duration": 9,
+          "size": 144
+        },
+        "error": null,
+        "status": "pass",
+        "assertionResults": [
+          {
+            "uid": "Df5Z6YYiDOPhMB4SR2HRo",
+            "lhsExpr": "res.status",
+            "rhsExpr": "eq 201",
+            "rhsOperand": "201",
+            "operator": "eq",
+            "status": "pass"
+          },
+          {
+            "uid": "opKM1EpGJbJ-kg8G0PExl",
+            "lhsExpr": "res.body.data.status",
+            "rhsExpr": "eq 'DRAFT'",
+            "rhsOperand": "'DRAFT'",
+            "operator": "eq",
+            "status": "pass"
+          }
+        ],
+        "testResults": [],
+        "preRequestTestResults": [],
+        "postResponseTestResults": [],
+        "shouldStopRunnerExecution": false,
+        "runDuration": 0.133451705,
+        "name": "TC-ORD-001 step1 Submit draft order creation request",
+        "suitename": "/home/lex/development/spec-run-graph/test_generated/bruno/orders/TC-ORD-001-step1-submit-draft-order-creation-request",
+        "path": "orders/TC-ORD-001-step1-submit-draft-order-creation-request.yml",
+        "iterationIndex": 0
+      },
+      {
+        "test": {
+          "filename": "orders/TC-ORD-001-step2-delete-created-order.yml"
+        },
+        "request": {
+          "method": "DELETE",
+          "url": "http://localhost:8000/v1/orders/a9c4fbad-10ad-43c9-b910-e8055a003e63",
+          "headers": {
+            "User-Agent": "bruno-runtime/4.3.0",
+            "Accept-Encoding": "gzip, compress, deflate, br",
+            "Host": "localhost:8000",
+            "Connection": "keep-alive",
+            "Accept": "application/json",
+            "Authorization": "Bearer ********",
+            "content-type": null
+          }
+        },
+        "response": {
+          "status": 200,
+          "statusText": "OK",
+          "headers": {
+            "date": "Sun, 25 Oct 2026 18:31:32 GMT",
+            "server": "uvicorn",
+            "content-length": "69",
+            "content-type": "application/json"
+          },
+          "data": {
+            "data": {
+              "id": "a9c4fbad-10ad-43c9-b910-e8055a003e63",
+              "deleted": true
+            }
+          },
+          "url": "http://localhost/v1/orders/a9c4fbad-10ad-43c9-b910-e8055a003e63",
+          "responseTime": 2,
+          "duration": 2,
+          "size": 69
+        },
+        "error": null,
+        "status": "pass",
+        "assertionResults": [],
+        "testResults": [],
+        "preRequestTestResults": [],
+        "postResponseTestResults": [],
+        "shouldStopRunnerExecution": false,
+        "runDuration": 0.003503587,
+        "name": "TC-ORD-001 step2 Delete created order",
+        "suitename": "/home/lex/development/spec-run-graph/test_generated/bruno/orders/TC-ORD-001-step2-delete-created-order",
+        "path": "orders/TC-ORD-001-step2-delete-created-order.yml",
+        "iterationIndex": 0
+      },
+      {
+        "test": {
+          "filename": "orders/TC-ORD-002a-zero-quantity.yml"
+        },
+        "request": {
+          "method": "POST",
+          "url": "http://localhost:8000/v1/orders",
+          "headers": {
+            "User-Agent": "bruno-runtime/4.3.0",
+            "Content-Length": "46",
+            "Accept-Encoding": "gzip, compress, deflate, br",
+            "Host": "localhost:8000",
+            "Connection": "keep-alive",
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+            "Authorization": "Bearer ********"
+          },
+          "data": "{\"items\": [{\"qty\": 0, \"sku\": \"SKU-ACTIVE-1\"}]}"
+        },
+        "response": {
+          "status": 422,
+          "statusText": "Unprocessable Content",
+          "headers": {
+            "date": "Sun, 25 Oct 2026 18:31:32 GMT",
+            "server": "uvicorn",
+            "content-length": "95",
+            "content-type": "application/json"
+          },
+          "data": {
+            "error": {
+              "code": "MIN_QTY_EXCEEDED",
+              "message": "qty must be at least 1",
+              "field": "items[0].qty"
+            }
+          },
+          "url": "http://localhost/v1/orders",
+          "responseTime": 2,
+          "duration": 2,
+          "size": 95
+        },
+        "error": null,
+        "status": "pass",
+        "assertionResults": [
+          {
+            "uid": "WaXyGGMMT0k_xN9ftGPyF",
+            "lhsExpr": "res.status",
+            "rhsExpr": "eq 422",
+            "rhsOperand": "422",
+            "operator": "eq",
+            "status": "pass"
+          },
+          {
+            "uid": "nSzm6Zfm9dnaRX7APLkxo",
+            "lhsExpr": "res.body.error.code",
+            "rhsExpr": "eq 'MIN_QTY_EXCEEDED'",
+            "rhsOperand": "'MIN_QTY_EXCEEDED'",
+            "operator": "eq",
+            "status": "pass"
+          },
+          {
+            "uid": "blWzGHSHHQDFnZ3P7UBLQ",
+            "lhsExpr": "res.body.error.field",
+            "rhsExpr": "eq 'items[0].qty'",
+            "rhsOperand": "'items[0].qty'",
+            "operator": "eq",
+            "status": "pass"
+          }
+        ],
+        "testResults": [],
+        "preRequestTestResults": [],
+        "postResponseTestResults": [],
+        "shouldStopRunnerExecution": false,
+        "runDuration": 0.01178295,
+        "name": "TC-ORD-002a zero-quantity",
+        "suitename": "/home/lex/development/spec-run-graph/test_generated/bruno/orders/TC-ORD-002a-zero-quantity",
+        "path": "orders/TC-ORD-002a-zero-quantity.yml",
+        "iterationIndex": 0
+      },
+      {
+        "test": {
+          "filename": "orders/TC-ORD-002b-negative-quantity.yml"
+        },
+        "request": {
+          "method": "POST",
+          "url": "http://localhost:8000/v1/orders",
+          "headers": {
+            "User-Agent": "bruno-runtime/4.3.0",
+            "Content-Length": "47",
+            "Accept-Encoding": "gzip, compress, deflate, br",
+            "Host": "localhost:8000",
+            "Connection": "keep-alive",
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+            "Authorization": "Bearer ********"
+          },
+          "data": "{\"items\": [{\"qty\": -1, \"sku\": \"SKU-ACTIVE-1\"}]}"
+        },
+        "response": {
+          "status": 422,
+          "statusText": "Unprocessable Content",
+          "headers": {
+            "date": "Sun, 25 Oct 2026 18:31:32 GMT",
+            "server": "uvicorn",
+            "content-length": "89",
+            "content-type": "application/json"
+          },
+          "data": {
+            "error": {
+              "code": "NEGATIVE_QTY",
+              "message": "qty must be positive",
+              "field": "items[0].qty"
+            }
+          },
+          "url": "http://localhost/v1/orders",
+          "responseTime": 2,
+          "duration": 2,
+          "size": 89
+        },
+        "error": null,
+        "status": "pass",
+        "assertionResults": [
+          {
+            "uid": "icZ2Ac7wKnQB2obU7-3bc",
+            "lhsExpr": "res.status",
+            "rhsExpr": "eq 422",
+            "rhsOperand": "422",
+            "operator": "eq",
+            "status": "pass"
+          },
+          {
+            "uid": "oGmmAZ3BmVel_HFitCe1j",
+            "lhsExpr": "res.body.error.code",
+            "rhsExpr": "eq 'NEGATIVE_QTY'",
+            "rhsOperand": "'NEGATIVE_QTY'",
+            "operator": "eq",
+            "status": "pass"
+          },
+          {
+            "uid": "7AW66zWVzw3eRPueC0gxg",
+            "lhsExpr": "res.body.error.field",
+            "rhsExpr": "eq 'items[0].qty'",
+            "rhsOperand": "'items[0].qty'",
+            "operator": "eq",
+            "status": "pass"
+          }
+        ],
+        "testResults": [],
+        "preRequestTestResults": [],
+        "postResponseTestResults": [],
+        "shouldStopRunnerExecution": false,
+        "runDuration": 0.00966446,
+        "name": "TC-ORD-002b negative-quantity",
+        "suitename": "/home/lex/development/spec-run-graph/test_generated/bruno/orders/TC-ORD-002b-negative-quantity",
+        "path": "orders/TC-ORD-002b-negative-quantity.yml",
+        "iterationIndex": 0
+      },
+      {
+        "test": {
+          "filename": "orders/TC-ORD-002c-over-max-quantity.yml"
+        },
+        "request": {
+          "method": "POST",
+          "url": "http://localhost:8000/v1/orders",
+          "headers": {
+            "User-Agent": "bruno-runtime/4.3.0",
+            "Content-Length": "49",
+            "Accept-Encoding": "gzip, compress, deflate, br",
+            "Host": "localhost:8000",
+            "Connection": "keep-alive",
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+            "Authorization": "Bearer ********"
+          },
+          "data": "{\"items\": [{\"qty\": 9999, \"sku\": \"SKU-ACTIVE-1\"}]}"
+        },
+        "response": {
+          "status": 500,
+          "statusText": "Internal Server Error",
+          "headers": {
+            "date": "Sun, 25 Oct 2026 18:31:32 GMT",
+            "server": "uvicorn",
+            "content-length": "21",
+            "content-type": "text/plain; charset=utf-8"
+          },
+          "data": "Internal Server Error",
+          "url": "http://localhost/v1/orders",
+          "responseTime": 2,
+          "duration": 2,
+          "size": 21
+        },
+        "error": null,
+        "status": "pass",
+        "assertionResults": [
+          {
+            "uid": "m8ZH6TneT48-JYUqd_O_I",
+            "lhsExpr": "res.status",
+            "rhsExpr": "eq 400",
+            "rhsOperand": "400",
+            "operator": "eq",
+            "status": "fail",
+            "error": "expected 500 to equal 400"
+          },
+          {
+            "uid": "2uVa1n1EKUEONZcEEynzO",
+            "lhsExpr": "res.body.error.code",
+            "rhsExpr": "eq 'MAX_ORDER_LIMIT'",
+            "rhsOperand": "'MAX_ORDER_LIMIT'",
+            "operator": "eq",
+            "status": "fail",
+            "error": "expected { name: 'TypeError', …(2) } to equal 'MAX_ORDER_LIMIT'"
+          },
+          {
+            "uid": "vsuWcZjBKjPY-3EeUxx-V",
+            "lhsExpr": "res.body.error.field",
+            "rhsExpr": "eq 'items[0].qty'",
+            "rhsOperand": "'items[0].qty'",
+            "operator": "eq",
+            "status": "fail",
+            "error": "expected { name: 'TypeError', …(2) } to equal 'items[0].qty'"
+          }
+        ],
+        "testResults": [],
+        "preRequestTestResults": [],
+        "postResponseTestResults": [],
+        "shouldStopRunnerExecution": false,
+        "runDuration": 0.011517653,
+        "name": "TC-ORD-002c over-max-quantity",
+        "suitename": "/home/lex/development/spec-run-graph/test_generated/bruno/orders/TC-ORD-002c-over-max-quantity",
+        "path": "orders/TC-ORD-002c-over-max-quantity.yml",
+        "iterationIndex": 0
+      }
+    ],
+    "summary": {
+      "totalRequests": 5,
+      "passedRequests": 4,
+      "failedRequests": 1,
+      "errorRequests": 0,
+      "skippedRequests": 0,
+      "skippedByBail": 0,
+      "totalAssertions": 11,
+      "passedAssertions": 8,
+      "failedAssertions": 3,
+      "totalTests": 0,
+      "passedTests": 0,
+      "failedTests": 0,
+      "totalPreRequestTests": 0,
+      "passedPreRequestTests": 0,
+      "failedPreRequestTests": 0,
+      "totalPostResponseTests": 0,
+      "passedPostResponseTests": 0,
+      "failedPostResponseTests": 0
+    }
+  }
+]

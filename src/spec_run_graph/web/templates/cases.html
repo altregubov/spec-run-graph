@@ -1,0 +1,17 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>Test cases</h1>
+<form class="filters" hx-get="/cases" hx-target="#cases-table" hx-trigger="change, keyup changed delay:300ms from:input" hx-push-url="true">
+  <input name="id" placeholder="id glob, e.g. TC-ORD-*" value="{{ f.id or '' }}">
+  <select name="module"><option value="">all modules</option>
+    {% for m in modules %}<option {{ 'selected' if f.module == m }}>{{ m }}</option>{% endfor %}</select>
+  <select name="status"><option value="">any status</option>
+    {% for s in ["DRAFT", "READY", "NEEDS_REVIEW", "DEPRECATED"] %}<option {{ 'selected' if f.status == s }}>{{ s }}</option>{% endfor %}</select>
+  <select name="type"><option value="">any type</option>
+    {% for s in ["POSITIVE", "NEGATIVE", "BOUNDARY", "SECURITY", "RBAC"] %}<option {{ 'selected' if f.type == s }}>{{ s }}</option>{% endfor %}</select>
+  <select name="priority"><option value="">any priority</option>
+    {% for s in ["P0", "P1", "P2"] %}<option {{ 'selected' if f.priority == s }}>{{ s }}</option>{% endfor %}</select>
+  <input name="tag" placeholder="tag" value="{{ f.tag or '' }}">
+</form>
+<div id="cases-table">{% include "_cases_table.html" %}</div>
+{% endblock %}

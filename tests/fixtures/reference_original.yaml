@@ -1,0 +1,87 @@
+# The reference test-case format as originally provided (before review fixes).
+module:
+  id: "ORD"
+  domain: "Orders"
+  target_spec: "examples/orders/openapi.yaml"
+  product_spec: "examples/orders/prd.md"
+
+module_defaults:
+  headers:
+    Content-Type: "application/json"
+    Accept: "application/json"
+  preconditions:
+    - "Target service is accessible in test environment"
+
+test_cases:
+  - id: "TC-ORD-001"
+    title: "Create draft order as authorized customer"
+    status: "ready"
+    type: "positive"
+    priority: "P0"
+    tags: ["smoke", "orders", "core"]
+    actor: "customer_standard"
+    coverage:
+      endpoints:
+        - "POST /v1/orders"
+      requirement_ref: "PRD-ORD-42"
+    preconditions:
+      - "User has verified payment method via {{ $fixture.valid_card }}"
+    variables:
+      idempotency_key: "{{ $faker.uuid }}"
+    steps:
+      - step: 1
+        name: "Submit draft order creation request"
+        type: "http"
+        endpoint: "POST /v1/orders"
+        request:
+          headers:
+            Idempotency-Key: "{{ $extract.idempotency_key }}"
+          payload:
+            items:
+              - sku: "{{ $fixture.active_sku }}"
+                qty: 1
+        expected_status: 201
+        validate_schema: true
+        extract:
+          order_id: "response.data.id"
+        assertions:
+          - check: "response.data.status == 'DRAFT'"
+            message: "Newly created order must have DRAFT status"
+    expected_results:
+      - "Order is created in DRAFT status with valid total sum"
+    cleanup:
+      - action: "DELETE /v1/orders/{{ $extract.order_id }}"
+        ignore_errors: true
+
+  - id: "TC-ORD-002"
+    title: "Reject order creation with invalid quantities"
+    status: "ready"
+    type: "boundary"
+    priority: "P1"
+    tags: ["orders", "bva", "negative"]
+    actor: "customer_standard"
+    coverage:
+      endpoints:
+        - "POST /v1/orders"
+      requirement_ref: "PRD-ORD-43"
+    parameters:
+      - { qty: 0,  expected_status: 422, error_code: "MIN_QTY_EXCEEDED" }
+      - { qty: -1, expected_status: 422, error_code: "NEGATIVE_QTY" }
+      - { qty: 9999, expected_status: 400, error_code: "MAX_ORDER_LIMIT" }
+    steps:
+      - step: 1
+        name: "Attempt order creation with out-of-boundary quantity"
+        endpoint: "POST /v1/orders"
+        request:
+          payload:
+            items:
+              - sku: "{{ $fixture.active_sku }}"
+                qty: "{{ $param.qty }}"
+        expected_status: "{{ $param.expected_status }}"
+        expected_error:
+          code: "{{ $param.error_code }}"
+          field: "items[0].qty"
+        assertions:
+          - check: "response.error.code == '{{ $param.error_code }}'"
+    expected_results:
+      - "API rejects request with appropriate error status and error code"

@@ -1,0 +1,28 @@
+{% extends "base.html" %}
+{% block content %}
+<p><a href="/runs">&larr; Runs</a></p>
+<h1>{{ run.run_id }} <span class="pill {{ run.status | lower }}">{{ run.status }}</span></h1>
+<p class="muted small">{{ run.base_url }} · started {{ run.started_at[:19] | replace("T", " ") }} ·
+  <a href="/runs/{{ run.run_id }}/stdout">bru output</a> · logs <code>{{ run.log_prefix_uri }}</code></p>
+{% if run.abort_reason %}<p class="err">{{ run.abort_reason }}</p>{% endif %}
+<section class="card">
+<div class="table-wrap"><table>
+  <thead><tr><th>Case</th><th>Row</th><th>Status</th><th>HTTP</th><th>ms</th><th>Failures</th><th>Log</th></tr></thead>
+  <tbody>
+  {% for e in run.executions %}
+  <tr>
+    <td><a href="/cases/{{ e.test_id }}">{{ e.test_id }}</a><div class="small muted">{{ e.title }}</div></td>
+    <td>{{ "abcdefghijklmnopqrstuvwxyz"[e.param_index] }}</td>
+    <td><span class="pill {{ e.status | lower }}">{{ e.status }}</span></td>
+    <td>{{ e.http_status or "" }}</td><td>{{ e.duration_ms or "" }}</td>
+    <td class="small">
+      {% for f in e.failed_assertions or [] %}<div><code>{{ f.assertion or f.test or f.file }}</code> <span class="err">{{ f.error }}</span></div>{% endfor %}
+      {% if e.error_message %}<div class="err">{{ e.error_message }}</div>{% endif %}
+    </td>
+    <td><a class="small" href="/runs/{{ run.run_id }}/logs/{{ e.test_id }}/{{ e.param_index }}">report</a></td>
+  </tr>
+  {% else %}<tr><td colspan="7" class="muted">No executions</td></tr>{% endfor %}
+  </tbody>
+</table></div>
+</section>
+{% endblock %}

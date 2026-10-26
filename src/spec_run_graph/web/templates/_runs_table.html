@@ -1,0 +1,18 @@
+<div class="table-wrap">
+<table>
+  <thead><tr><th>Run</th><th>Status</th><th>Modules</th><th>Passed</th><th>Failed</th><th>Total</th><th>Started</th><th>Duration</th></tr></thead>
+  <tbody>
+  {% for r in runs %}
+  <tr>
+    <td><a href="/runs/{{ r.run_id }}">{{ r.run_id }}</a></td>
+    <td><span class="pill {{ r.status | lower }}">{{ r.status }}</span>
+      {% if r.abort_reason %}<div class="small err">{{ r.abort_reason }}</div>{% endif %}</td>
+    <td>{{ r.module_codes | join(", ") }}</td>
+    <td>{{ r.passed }}</td><td>{{ r.failed }}</td><td>{{ r.total }}</td>
+    <td class="small">{{ r.started_at[:19] | replace("T", " ") }}</td>
+    <td class="small">{{ "%.1fs" | format(r.duration_s) if r.duration_s is not none else "-" }}</td>
+  </tr>
+  {% else %}<tr><td colspan="8" class="muted">No runs yet - <code>srg test</code></td></tr>{% endfor %}
+  </tbody>
+</table>
+</div>

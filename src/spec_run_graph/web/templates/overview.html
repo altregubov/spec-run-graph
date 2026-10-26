@@ -1,0 +1,36 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>Overview</h1>
+<section class="tiles">
+  <div class="tile"><span class="label">Test cases</span><span class="value">{{ o.total_cases }}</span>
+    <span class="muted small">{{ o.deprecated }} deprecated</span></div>
+  <div class="tile"><span class="label">Endpoint coverage</span><span class="value">{{ o.endpoint_coverage_pct }}%</span>
+    <span class="muted small">{{ o.endpoints_covered }} / {{ o.endpoints_total }} endpoints</span></div>
+  <div class="tile"><span class="label">Requirements covered</span>
+    <span class="value">{{ o.requirements_covered }}<span class="of"> / {{ o.requirements_total }}</span></span></div>
+  <div class="tile"><span class="label">Last run pass rate</span>
+    <span class="value">{{ o.last_run_pass_rate if o.last_run_pass_rate is not none else '-' }}{% if o.last_run_pass_rate is not none %}%{% endif %}</span>
+    {% if o.last_run %}<a class="small" href="/runs/{{ o.last_run.run_id }}">{{ o.last_run.passed }} / {{ o.last_run.total }} passed</a>{% endif %}</div>
+</section>
+
+<section class="grid2">
+  {% for title, key in [("Design status", "by_status"), ("Generation status", "by_gen"), ("Case type", "by_type"), ("Priority", "by_priority"), ("Module", "by_module")] %}
+  {% set d = o[key] %}{% set total = (d.values() | sum) or 1 %}
+  <div class="card">
+    <h3>{{ title }}</h3>
+    {% for k, n in d | dictsort %}
+    <div class="bar-row">
+      <span class="bar-label">{{ k }}</span>
+      <span class="bar"><span style="width: {{ (100 * n / total) | round(1) }}%"></span></span>
+      <span class="bar-num">{{ n }}</span>
+    </div>
+    {% else %}<p class="muted">no data</p>{% endfor %}
+  </div>
+  {% endfor %}
+</section>
+
+<section class="card">
+  <h3>Recent runs</h3>
+  {% include "_runs_table.html" %}
+</section>
+{% endblock %}

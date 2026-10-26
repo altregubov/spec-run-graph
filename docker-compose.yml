@@ -1,0 +1,38 @@
+name: spec-run-graph
+
+services:
+  gel:
+    image: geldata/gel:6
+    container_name: srg-gel
+    environment:
+      GEL_SERVER_SECURITY: insecure_dev_mode
+      GEL_SERVER_TLS_CERT_MODE: generate_self_signed
+      GEL_SERVER_ADMIN_UI: enabled
+    ports:
+      - "5656:5656"
+    volumes:
+      - gel-data:/var/lib/gel/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -skf https://localhost:5656/server/status/ready || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+
+  # Official minio/minio images are no longer published on Docker Hub;
+  # pgsty/minio is a maintained community build of the same server.
+  minio:
+    image: pgsty/minio:latest
+    container_name: srg-minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio-data:/data
+
+volumes:
+  gel-data:
+  minio-data:

@@ -1,0 +1,202 @@
+openapi: 3.0.3
+info:
+  title: Orders API
+  version: 1.1.0
+  description: Customer order management for the demo shop.
+servers:
+  - url: http://localhost:8000
+tags:
+  - name: products
+  - name: orders
+security:
+  - bearerAuth: []
+paths:
+  /v1/products:
+    get:
+      tags: [products]
+      operationId: listProducts
+      summary: List active products
+      responses:
+        "200":
+          description: Active products
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    type: array
+                    items: { $ref: "#/components/schemas/Product" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+  /v1/orders:
+    post:
+      tags: [orders]
+      operationId: createOrder
+      summary: Create a draft order
+      parameters:
+        - name: Idempotency-Key
+          in: header
+          required: false
+          schema: { type: string, format: uuid }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CreateOrderRequest" }
+      responses:
+        "201":
+          description: Order created in DRAFT status
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data: { $ref: "#/components/schemas/Order" }
+        "400":
+          description: Order exceeds the per-line quantity limit (qty > 50) - error code MAX_ORDER_LIMIT
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "422":
+          description: Validation error - MIN_QTY_EXCEEDED (qty = 0), NEGATIVE_QTY (qty < 0), UNKNOWN_SKU
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+  /v1/orders/{orderId}:
+    parameters:
+      - name: orderId
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+    get:
+      tags: [orders]
+      operationId: getOrder
+      summary: Get an order by id
+      responses:
+        "200":
+          description: The order
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data: { $ref: "#/components/schemas/Order" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    delete:
+      tags: [orders]
+      operationId: deleteOrder
+      summary: Delete an order
+      responses:
+        "200":
+          description: Order deleted
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: object
+                    properties:
+                      id: { type: string }
+                      deleted: { type: boolean }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403":
+          description: The order belongs to another customer
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /v1/orders/{orderId}/confirm:
+    parameters:
+      - name: orderId
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+    post:
+      tags: [orders]
+      operationId: confirmOrder
+      summary: Confirm a draft order
+      responses:
+        "200":
+          description: Order confirmed
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data: { $ref: "#/components/schemas/Order" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409":
+          description: Order is not in DRAFT status - error code INVALID_STATE
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+  responses:
+    Unauthorized:
+      description: Missing or invalid bearer token
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    NotFound:
+      description: Resource not found
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+  schemas:
+    Product:
+      type: object
+      required: [sku, name, price]
+      properties:
+        sku: { type: string }
+        name: { type: string }
+        price: { type: number }
+    CreateOrderRequest:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          minItems: 1
+          items:
+            type: object
+            required: [sku, qty]
+            properties:
+              sku: { type: string }
+              qty: { type: integer, minimum: 1, maximum: 50 }
+    Order:
+      type: object
+      required: [id, status, items, total]
+      properties:
+        id: { type: string, format: uuid }
+        status: { type: string, enum: [DRAFT, CONFIRMED, CANCELLED] }
+        items:
+          type: array
+          items:
+            type: object
+            properties:
+              sku: { type: string }
+              qty: { type: integer }
+        total: { type: number }
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code: { type: string }
+            message: { type: string }
+            field: { type: string }
