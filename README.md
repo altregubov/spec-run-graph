@@ -41,7 +41,45 @@ uv run srg web                                          # dashboard + chatbot on
 - If a spec changes (try `examples/orders_v2/`), the cases it affects become `NEEDS_REVIEW`.
 - You can run the generated collection with Bruno directly:
   `cd test_generated/bruno && CUSTOMER_TOKEN=customer-token bru run orders --env local`.
-- `srg reset` deletes **all** data in Gel and all objects in the bucket. It asks for confirmation first, and `--files` also removes `test_generated/` and `reports/`.
+## Cleaning Gel and S3
+
+`srg reset` deletes all data in Gel and all objects in the MinIO bucket in one command:
+
+```bash
+uv run srg reset
+```
+
+It first shows what will be deleted (object counts per Gel type, plus the number of objects and total size in `s3://spec-run-telemetry`), then asks for confirmation.
+
+| Flag | Effect |
+|---|---|
+| `--yes` / `-y` | Skip the confirmation prompt (for scripts) |
+| `--files` | Also delete `test_generated/` and `reports/` |
+| `--schema` | Also reset the Gel schema and re-apply it (use this after incompatible schema changes) |
+| `--force-remote` | Allow a reset when `GEL_DSN` or `S3_ENDPOINT_URL` isn't a local host; without it the command refuses |
+
+A full clean start:
+
+```bash
+uv run srg reset --yes --files
+```
+
+What's kept:
+- The Gel schema stays unless you pass `--schema`.
+- The bucket itself stays; only its objects are deleted.
+- The `TestEngine(bruno)` row is re-created automatically.
+
+How it deletes:
+- Gel is wiped in one transaction, so it either deletes everything or nothing.
+- S3 objects are deleted after that. If any fail, they're listed, and you can safely run `srg reset` again.
+
+To remove the Docker containers and their data volumes:
+
+```bash
+docker compose down -v
+```
+
+After that, `docker compose up -d` followed by `uv run srg doctor` recreates the schema and the bucket.
 
 ## Tests
 
