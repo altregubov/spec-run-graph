@@ -7,7 +7,7 @@
 {% if run.abort_reason %}<p class="err">{{ run.abort_reason }}</p>{% endif %}
 <section class="card">
 <div class="table-wrap"><table>
-  <thead><tr><th>Case</th><th>Row</th><th>Status</th><th>HTTP</th><th>ms</th><th>Failures</th><th>Log</th></tr></thead>
+  <thead><tr><th>Case</th><th>Row</th><th>Status</th><th>HTTP</th><th>ms</th><th>Failures</th><th>Diagnosis</th><th>Log</th></tr></thead>
   <tbody>
   {% for e in run.executions %}
   <tr>
@@ -19,9 +19,18 @@
       {% for f in e.failed_assertions or [] %}<div><code>{{ f.assertion or f.test or f.file }}</code> <span class="err">{{ f.error }}</span></div>{% endfor %}
       {% if e.error_message %}<div class="err">{{ e.error_message }}</div>{% endif %}
     </td>
+    <td class="small">{% if e.diagnosis %}{% set d = e.diagnosis %}
+      <span class="pill diag-{{ d.category | lower }}">{{ d.category }}</span>
+      <span class="muted">{{ "%.0f" | format(100 * d.confidence) }}% · {{ d.source | lower }}</span>
+      <div>{{ d.root_cause }}</div>
+      {% if d.recommended_action %}<div class="muted">→ {{ d.recommended_action }}</div>{% endif %}
+      {% if d.suggested_fix %}<div class="muted">fix: {{ d.suggested_fix }}</div>{% endif %}
+      {% if d.evidence %}<details><summary class="muted">evidence</summary><ul>{% for x in d.evidence %}<li>{{ x }}</li>{% endfor %}</ul></details>{% endif %}
+      {% if d.rerun_status %}<div class="muted">rerun: {{ d.rerun_status }}</div>{% endif %}
+    {% elif e.status != "PASSED" %}<span class="muted">not diagnosed - <code>srg diagnose {{ run.run_id }}</code></span>{% endif %}</td>
     <td><a class="small" href="/runs/{{ run.run_id }}/logs/{{ e.test_id }}/{{ e.param_index }}">report</a></td>
   </tr>
-  {% else %}<tr><td colspan="7" class="muted">No executions</td></tr>{% endfor %}
+  {% else %}<tr><td colspan="8" class="muted">No executions</td></tr>{% endfor %}
   </tbody>
 </table></div>
 </section>

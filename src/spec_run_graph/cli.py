@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import shutil
+import time
 from functools import wraps
 from pathlib import Path
 from typing import Annotated
@@ -18,6 +19,7 @@ from spec_run_graph.config import get_settings
 from spec_run_graph.deps import GraphDependencies
 from spec_run_graph.knowledge import db, repo
 from spec_run_graph.knowledge.repo import CaseFilter
+from spec_run_graph.llm import USAGE
 from spec_run_graph.pipeline.graph import PipelineGraphState, run_pipeline
 
 app = typer.Typer(help="SpecRunGraph: spec-driven API tests (OpenAPI + PRD -> Gel -> Bruno).", no_args_is_help=True)
@@ -38,10 +40,25 @@ def run_async(fn):
 
 async def _pipeline(state: PipelineGraphState) -> PipelineGraphState:
     deps = GraphDependencies(console=console)
+    started = time.monotonic()
     try:
         return await run_pipeline(state, deps)
     finally:
         await deps.aclose()
+        print_llm_usage(time.monotonic() - started)
+
+
+def print_llm_usage(wall_seconds: float) -> None:
+    u = USAGE
+    if not u.calls:
+        return
+    agents = ", ".join(f"{name} {int(n)}x/{sec:.0f}s" for name, (n, sec) in u.by_agent.items())
+    console.print(
+        f"[dim]LLM {get_settings().srg_model}: {u.calls} calls, {u.input_tokens:,} in / {u.output_tokens:,} out "
+        f"tokens, {u.seconds:.0f}s total call time in {wall_seconds:.0f}s wall time ({agents})"
+        + (f", {u.fallbacks} prompted-mode fallbacks" if u.fallbacks else "")
+        + "[/]"
+    )
 
 
 # ---------------------------------------------------------------- printing
@@ -107,6 +124,10 @@ def print_plan(state: PipelineGraphState) -> None:
         console.print(f"  [red]dropped invalid[/] {code} '{title}': {errs[:3]}")
     if p.flagged_for_review:
         console.print(f"  [magenta]{p.flagged_for_review} existing cases flagged NEEDS_REVIEW by spec changes[/]")
+    for code, chunk, err in p.failed_chunks:
+        console.print(f"  [red]planning failed[/] {code} {chunk}: {err}")
+    if p.failed_chunks:
+        console.print("  Re-run the same [bold]srg plan[/] command to fill the missing coverage.")
     if p.deprecated:
         console.print(f"  deprecated {p.deprecated} old cases (--replace)")
     console.print("Review with [bold]srg cases[/] / [bold]srg show <id>[/]; implement with [bold]srg build[/].")
@@ -153,6 +174,98 @@ def print_run(state: PipelineGraphState) -> bool:
         passed = sum(o.status == "PASSED" for o in r.outcomes)
         console.print(f"  {passed}/{len(r.outcomes)} passed. Logs: s3://{get_settings().s3_bucket}/runs/{r.run_id}/")
     return r.ok
+
+
+CATEGORY_COLORS = {
+    "APPLICATION_BUG": "red",
+    "SPEC_MISMATCH": "magenta",
+    "TEST_DEFECT": "yellow",
+    "ENV_FAILURE": "cyan",
+    "FLAKY": "blue",
+    "UNKNOWN": "white",
+}
+
+
+def print_diagnosis(state: PipelineGraphState, show_empty: bool = False) -> None:
+    d = state.diagnosis
+    if d is None:
+        return
+    if d.run_id is None:
+        console.print("[yellow]No completed run to diagnose.[/]")
+        return
+    if not d.rows and not d.errors:
+        if show_empty:
+            console.print(
+                f"Run {d.run_id}: nothing to diagnose"
+                + (f" ({d.skipped_existing} already diagnosed; use --force)" if d.skipped_existing else "")
+            )
+        return
+    console.rule(f"[bold]Failure analysis {d.run_id}")
+    t = Table("case", "row", "category", "conf", "root cause", "action / fix")
+    for r in d.rows:
+        color = CATEGORY_COLORS.get(r.category, "white")
+        action = r.recommended_action + (f"\n[dim]fix: {r.suggested_fix}[/]" if r.suggested_fix else "")
+        rerun = f"\n[dim]rerun: {r.rerun}[/]" if r.rerun else ""
+        t.add_row(
+            r.test_id,
+            chr(ord("a") + r.param_index),
+            f"[{color}]{r.category}[/]\n[dim]{r.source}[/]",
+            f"{r.confidence:.2f}",
+            r.root_cause + rerun,
+            action,
+        )
+    console.print(t)
+    counts: dict[str, int] = {}
+    for r in d.rows:
+        counts[r.category] = counts.get(r.category, 0) + 1
+    console.print("  " + ", ".join(f"[{CATEGORY_COLORS.get(k, 'white')}]{k}[/]={v}" for k, v in sorted(counts.items())))
+    if counts.get("TEST_DEFECT"):
+        console.print("  TEST_DEFECT cases were set to NEEDS_REVIEW: fix them, then [bold]srg show <id> --approve[/].")
+    for tid, pidx, err in d.errors:
+        console.print(f"  [red]diagnosis failed[/] {tid}{chr(ord('a') + pidx)}: {err}")
+    console.print(f"  [dim]{len(d.rows)} failures in {d.groups} groups; {d.llm_investigations} LLM investigations[/]")
+    if d.not_diagnosed:
+        console.print(f"  [yellow]{d.not_diagnosed} failures not diagnosed (over --max-llm); re-run srg diagnose[/]")
+    if d.skipped_existing:
+        console.print(f"  [dim]{d.skipped_existing} already diagnosed (srg diagnose --force to redo)[/]")
+
+
+HEAL_COLORS = {
+    "VERIFIED": "green",
+    "UNVERIFIED": "yellow",
+    "ROLLED_BACK": "red",
+    "REJECTED": "magenta",
+    "FAILED": "red",
+}
+
+
+def print_healing(state: PipelineGraphState, show_empty: bool = False) -> None:
+    h = state.healing
+    if h is None:
+        return
+    if not h.rows:
+        if show_empty:
+            console.print(f"Run {h.run_id or '-'}: no TEST_DEFECT failures to heal (run [bold]srg diagnose[/] first)")
+        return
+    console.rule(f"[bold]Self-healing {h.run_id}")
+    t = Table("case", "result", "attempts", "change", "detail")
+    for r in h.rows:
+        t.add_row(
+            r.test_id,
+            f"[{HEAL_COLORS.get(r.status, 'white')}]{r.status}[/]",
+            str(r.attempts),
+            r.change_summary,
+            (r.detail or "")[:200],
+        )
+    console.print(t)
+    counts: dict[str, int] = {}
+    for r in h.rows:
+        counts[r.status] = counts.get(r.status, 0) + 1
+    console.print("  " + ", ".join(f"[{HEAL_COLORS.get(k, 'white')}]{k}[/]={v}" for k, v in sorted(counts.items())))
+    if h.verify_run_ids:
+        console.print(f"  [dim]verification runs: {', '.join(h.verify_run_ids)}[/]")
+    if counts.get("ROLLED_BACK") or counts.get("FAILED"):
+        console.print("  Rolled-back cases are NEEDS_REVIEW with the reason; see [bold]srg show <id>[/].")
 
 
 # ---------------------------------------------------------------- commands
@@ -264,23 +377,79 @@ async def test_(
     env: Annotated[str, typer.Option(help="Bruno environment")] = "local",
     base_url: Annotated[str | None, typer.Option(help="override SUT_BASE_URL")] = None,
     skip_health_check: bool = False,
+    diagnose: Annotated[bool, typer.Option(help="analyse failures with the diagnostics agent")] = True,
+    heal: Annotated[bool, typer.Option(help="repair TEST_DEFECT cases, rebuild and re-run them")] = False,
+    rerun: Annotated[bool, typer.Option(help="allow the agent to re-run a failed case once")] = True,
     engine: Annotated[str, typer.Option(help="test engine")] = "bruno",
 ) -> None:
-    """Run the generated suite with bru; results -> Gel, logs -> MinIO. Exit code 1 on any failure."""
+    """Run the generated suite with bru; results -> Gel, logs -> MinIO; failures are diagnosed (LLM).
+    Exit code 1 on any failure."""
     if engine != "bruno":
         raise typer.BadParameter("only the bruno engine is implemented")
     state = await _pipeline(
         PipelineGraphState(
             start="test",
-            stop="test",
+            stop="heal" if heal else ("diagnose" if diagnose else "test"),
             case_filter=CaseFilter(id_, tags or []),
             env_name=env,
             base_url=base_url,
             skip_health_check=skip_health_check,
+            rerun_failures=rerun,
         )
     )
-    if not print_run(state):
+    ok = print_run(state)
+    print_diagnosis(state)
+    print_healing(state)
+    if not ok:
         raise typer.Exit(1)
+
+
+@app.command("heal")
+@run_async
+async def heal_(
+    run_id: Annotated[str | None, typer.Argument(help="run id (default: latest completed run)")] = None,
+    id_: IdOpt = None,
+    tags: TagsOpt = None,
+    verify: Annotated[bool, typer.Option(help="rebuild + re-run healed cases; roll back heals that still fail")] = True,
+    max_cases: Annotated[int, typer.Option(help="max test cases to heal")] = 20,
+) -> None:
+    """Repair test cases whose failures were diagnosed as TEST_DEFECT (run `srg diagnose` first)."""
+    state = await _pipeline(
+        PipelineGraphState(
+            start="heal",
+            stop="heal",
+            case_filter=CaseFilter(id_, tags or []),
+            diagnose_run_id=run_id,
+            heal_verify=verify,
+            max_heal_cases=max_cases,
+        )
+    )
+    print_healing(state, show_empty=True)
+
+
+@app.command()
+@run_async
+async def diagnose(
+    run_id: Annotated[str | None, typer.Argument(help="run id (default: latest completed run)")] = None,
+    id_: IdOpt = None,
+    tags: TagsOpt = None,
+    force: Annotated[bool, typer.Option(help="re-diagnose executions that already have a diagnosis")] = False,
+    rerun: Annotated[bool, typer.Option(help="allow the agent to re-run a failed case once")] = True,
+    max_llm: Annotated[int, typer.Option(help="max LLM investigations (one per failure group)")] = 30,
+    group: Annotated[bool, typer.Option(help="diagnose one representative per failure signature")] = True,
+) -> None:
+    """Analyse the failed executions of a run: why did it fail, and is it the API, the spec or the test?"""
+    state = await _pipeline(
+        PipelineGraphState(
+            start="diagnose",
+            stop="diagnose",
+            case_filter=CaseFilter(id_, tags or []),
+            force=force,
+            diagnose_run_id=run_id,
+            rerun_failures=rerun,
+        )
+    )
+    print_diagnosis(state, show_empty=True)
 
 
 @app.command()
@@ -291,12 +460,14 @@ async def go(
 ) -> None:
     """analyze -> plan -> build -> test in one shot."""
     state = await _pipeline(
-        PipelineGraphState(start="analyze", stop="test", spec_paths=specs or [Path(".")], base_url=base_url)
+        PipelineGraphState(start="analyze", stop="diagnose", spec_paths=specs or [Path(".")], base_url=base_url)
     )
     print_analysis(state)
     print_plan(state)
     print_build(state)
-    if not print_run(state):
+    ok = print_run(state)
+    print_diagnosis(state)
+    if not ok:
         raise typer.Exit(1)
 
 
@@ -345,6 +516,7 @@ async def show(
         if new_status and not await repo.set_design_status(client, test_id, new_status):
             raise typer.BadParameter(f"unknown test id {test_id}")
         row = await repo.get_case(client, test_id)
+        heals = await repo.heal_history(client, test_id) if row else []
     finally:
         await client.aclose()
     if row is None:
@@ -356,6 +528,12 @@ async def show(
     console.print(f"gen_status={row.gen_status} model={row.gen_model or '-'} files={row.script_path or '-'}")
     if row.last_gen_error:
         console.print(f"[red]last generation error:[/] {row.last_gen_error[:1000]}")
+    for h in heals:
+        color = HEAL_COLORS.get(h["status"], "white")
+        console.print(
+            f"heal {h['created_at'][:19]} run {h['run_id']} attempt {h['attempt']}: "
+            f"[{color}]{h['status']}[/] - {h['change_summary']}"
+        )
 
 
 LOCAL_HOSTS = {"localhost", "127.0.0.1", "::1", "gel", "minio", "srg-gel", "srg-minio"}

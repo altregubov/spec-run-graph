@@ -20,7 +20,7 @@ from sse_starlette.sse import EventSourceResponse
 from spec_run_graph.agents.chatbot import ChatDeps, build_agent
 from spec_run_graph.config import get_settings
 from spec_run_graph.knowledge import db, repo, stats
-from spec_run_graph.llm import LLMNotConfigured, build_model, model_name
+from spec_run_graph.llm import LLMNotConfigured, build_model, model_name, request_settings
 from spec_run_graph.telemetry.s3 import TelemetryStore, case_prefix
 
 HERE = Path(__file__).parent
@@ -80,7 +80,8 @@ async def case_page(request: Request, test_id: str):
                error_message, created_at } filter .test_case.test_id = <str>$t order by .created_at desc limit 20""",
         t=test_id,
     )
-    return render(request, "case.html", page="cases", c=row, ir_yaml=ir_yaml, executions=json.loads(raw))
+    heals = await repo.heal_history(request.app.state.client, test_id)
+    return render(request, "case.html", page="cases", c=row, ir_yaml=ir_yaml, executions=json.loads(raw), heals=heals)
 
 
 @app.get("/endpoints", response_class=HTMLResponse)
@@ -143,7 +144,11 @@ async def chat_stream(request: Request, body: ChatIn):
         history = CHAT_HISTORY.get(session, [])
         try:
             async with request.app.state.chatbot.run_stream(
-                body.message, deps=deps, model=model, message_history=history
+                body.message,
+                deps=deps,
+                model=model,
+                message_history=history,
+                model_settings=request_settings(thinking=True, session=session),
             ) as result:
                 async for delta in result.stream_text(delta=True):
                     yield {"event": "token", "data": json.dumps(delta)}

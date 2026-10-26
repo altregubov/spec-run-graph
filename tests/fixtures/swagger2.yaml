@@ -1,0 +1,33 @@
+swagger: "2.0"
+info: {title: Pets API, version: "2.1"}
+host: localhost:9999
+basePath: /api
+schemes: [http]
+securityDefinitions:
+  bearer: {type: apiKey, name: Authorization, in: header}
+paths:
+  /pets/{petId}:
+    get:
+      tags: [pets]
+      operationId: getPet
+      security: [{bearer: []}]
+      parameters:
+        - {name: petId, in: path, required: true, type: string, format: uuid}
+        - {name: verbose, in: query, type: boolean}
+      responses:
+        "200": {description: The pet, schema: {$ref: "#/definitions/Pet"}}
+        "404": {description: Not found}
+  /pets:
+    post:
+      tags: [pets]
+      parameters:
+        - {name: body, in: body, required: true, schema: {$ref: "#/definitions/Pet"}}
+      responses:
+        "201": {description: Created, schema: {$ref: "#/definitions/Pet"}}
+definitions:
+  Pet:
+    type: object
+    required: [name]
+    properties:
+      name: {type: string}
+      age: {type: integer, minimum: 0}

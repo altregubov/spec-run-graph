@@ -1,4 +1,4 @@
-"""Deterministic OpenAPI 3.x parsing: endpoints, resolved schemas and a compact prompt digest."""
+"""Deterministic OpenAPI 3.x / Swagger 2.0 parsing: endpoints, resolved schemas and a compact prompt digest."""
 
 from __future__ import annotations
 
@@ -52,13 +52,31 @@ def _json_schema_of(content: dict | None) -> Any | None:
     return first.get("schema")
 
 
+def parse_document(raw: str, suffix: str) -> Any:
+    return json.loads(raw) if suffix == ".json" else yaml.safe_load(raw)
+
+
+def is_api_document(doc: Any) -> bool:
+    """OpenAPI 3.x (`openapi:`) or Swagger 2.0 (`swagger: "2.0"`)."""
+    return isinstance(doc, dict) and ("openapi" in doc or str(doc.get("swagger", "")).startswith("2"))
+
+
+def _swagger2_param_schema(prm: dict) -> dict:
+    """Swagger 2.0 non-body parameters carry their type inline instead of in `schema`."""
+    keys = ("type", "format", "items", "enum", "minimum", "maximum", "minLength", "maxLength", "pattern", "default")
+    return {k: prm[k] for k in keys if k in prm}
+
+
 def load_openapi(path: Path) -> LoadedSpec:
     raw = path.read_text()
-    doc = json.loads(raw) if path.suffix == ".json" else yaml.safe_load(raw)
-    if not isinstance(doc, dict) or "openapi" not in doc:
-        raise ValueError(f"{path} is not an OpenAPI 3.x document")
+    doc = parse_document(raw, path.suffix)
+    if not is_api_document(doc):
+        raise ValueError(f"{path} is not an OpenAPI 3.x or Swagger 2.0 document")
+    swagger2 = "openapi" not in doc
     info = doc.get("info", {})
     global_security = doc.get("security")
+    # Swagger 2.0 paths are relative to basePath; endpoint keys use the full request path.
+    base_path = (doc.get("basePath") or "").rstrip("/") if swagger2 else ""
     endpoints: list[EndpointDraft] = []
     for p, item in (doc.get("paths") or {}).items():
         item = resolve_refs(item, doc)
@@ -67,19 +85,35 @@ def load_openapi(path: Path) -> LoadedSpec:
             if method.upper() not in HTTP_METHODS or not isinstance(op, dict):
                 continue
             params = [*shared_params, *op.get("parameters", [])]
-            responses = {
-                str(status): {
-                    "description": resp.get("description", ""),
-                    "schema": _json_schema_of(resp.get("content")),
+            if swagger2:
+                body_params = [prm for prm in params if prm.get("in") == "body"]
+                form_params = [prm for prm in params if prm.get("in") == "formData"]
+                params = [prm for prm in params if prm.get("in") not in ("body", "formData")]
+                request_schema = body_params[0].get("schema") if body_params else None
+                if form_params and request_schema is None:
+                    request_schema = {
+                        "type": "object",
+                        "required": [prm["name"] for prm in form_params if prm.get("required")],
+                        "properties": {prm["name"]: _swagger2_param_schema(prm) for prm in form_params},
+                    }
+                responses = {
+                    str(status): {"description": resp.get("description", ""), "schema": resp.get("schema")}
+                    for status, resp in (op.get("responses") or {}).items()
                 }
-                for status, resp in (op.get("responses") or {}).items()
-            }
-            body = op.get("requestBody") or {}
+            else:
+                request_schema = _json_schema_of((op.get("requestBody") or {}).get("content"))
+                responses = {
+                    str(status): {
+                        "description": resp.get("description", ""),
+                        "schema": _json_schema_of(resp.get("content")),
+                    }
+                    for status, resp in (op.get("responses") or {}).items()
+                }
             security = op.get("security", global_security)
             endpoints.append(
                 EndpointDraft(
                     method=method.upper(),
-                    path=p,
+                    path=base_path + p,
                     operation_id=op.get("operationId"),
                     summary=op.get("summary") or op.get("description"),
                     tag=(op.get("tags") or [None])[0],
@@ -88,15 +122,20 @@ def load_openapi(path: Path) -> LoadedSpec:
                             "name": prm.get("name"),
                             "in": prm.get("in"),
                             "required": bool(prm.get("required")),
-                            "schema": prm.get("schema"),
+                            "schema": prm.get("schema") or _swagger2_param_schema(prm),
                         }
                         for prm in params
                     ],
-                    request_schema=_json_schema_of(body.get("content")),
+                    request_schema=request_schema,
                     response_schemas=responses,
                     requires_auth=bool(security),
                 )
             )
+    if swagger2:
+        scheme = (doc.get("schemes") or ["http"])[0]
+        servers = [f"{scheme}://{doc['host']}{base_path}"] if doc.get("host") else []
+    else:
+        servers = [s.get("url") for s in doc.get("servers", []) if s.get("url")]
     return LoadedSpec(
         name=info.get("title") or path.stem,
         spec_type="OPENAPI",
@@ -104,7 +143,7 @@ def load_openapi(path: Path) -> LoadedSpec:
         source_path=str(path),
         raw_content=raw,
         endpoints=endpoints,
-        servers=[s.get("url") for s in doc.get("servers", []) if s.get("url")],
+        servers=servers,
     )
 
 

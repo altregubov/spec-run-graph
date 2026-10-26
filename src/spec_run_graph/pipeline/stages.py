@@ -1,8 +1,11 @@
-"""Pipeline stages: analyze -> plan (Gel) -> build (Bruno) -> test (bru run). Every LLM call uses the .env model."""
+"""Pipeline stages: analyze -> plan (Gel) -> build (Bruno) -> test (bru run) -> diagnose.
+
+Every LLM call uses the .env model."""
 
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import hashlib
 import json
 import re
@@ -15,7 +18,7 @@ from typing import Any
 import httpx
 import yaml
 
-from spec_run_graph.agents import analyzer, planner, synthesizer
+from spec_run_graph.agents import analyzer, diagnostics, healer, planner, synthesizer
 from spec_run_graph.config import dotenv_values
 from spec_run_graph.deps import GraphDependencies
 from spec_run_graph.domain.analysis import AnalysisReport, SpecRef
@@ -34,7 +37,10 @@ from spec_run_graph.telemetry.s3 import case_prefix, run_prefix
 
 
 async def analyze_stage(deps: GraphDependencies, paths: list[Path]) -> tuple[list[LoadedSpec], AnalysisReport]:
-    specs = load_specs(paths)
+    skipped: list[Path] = []
+    specs = load_specs(paths, skipped)
+    for f in skipped:
+        deps.console.print(f"[yellow]Skipping {f}: not an OpenAPI 3.x / Swagger 2.0 document[/]")
     deps.console.print(
         f"[bold]Analyzing {len(specs)} specs jointly[/] with [cyan]{model_name()}[/]: "
         + ", ".join(f"{s.name} ({s.spec_type})" for s in specs)
@@ -138,6 +144,7 @@ class PlanSummary:
     duplicates: list[tuple[str, str]] = field(default_factory=list)
     flagged_for_review: int = 0
     deprecated: int = 0
+    failed_chunks: list[tuple[str, list[str], str]] = field(default_factory=list)  # (module, endpoints, error)
 
 
 async def plan_stage(
@@ -161,6 +168,27 @@ async def plan_stage(
     endpoints = {e.key: e for s in specs for e in s.endpoints}
     sem = asyncio.Semaphore(deps.settings.srg_llm_concurrency)
 
+    chunk_size = max(1, deps.settings.srg_plan_chunk_size)
+
+    async def plan_chunk(m, chunk: list[str], ctx: ValidationContext, existing: list[dict]) -> list[CaseDraft]:
+        async with sem:
+            deps.console.print(f"  planning [bold]{m.code}[/] {chunk} ({len(existing)} existing cases)...")
+            try:
+                drafts, dropped = await planner.plan_module(
+                    report.analysis,
+                    m.model_copy(update={"endpoints": chunk}),
+                    endpoints,
+                    ctx,
+                    existing,
+                    model=deps.model,
+                )
+            except Exception as exc:  # one bad LLM answer must not lose the other modules
+                summary.failed_chunks.append((m.code, chunk, f"{exc.__class__.__name__}: {str(exc)[:300]}"))
+                deps.console.print(f"  [red]planning {m.code} {chunk} failed[/]: {exc.__class__.__name__}")
+                return []
+        summary.dropped_invalid += [(m.code, title, errs) for title, errs in dropped]
+        return drafts
+
     async def one(m) -> None:
         if replace:
             summary.deprecated += await repo.deprecate_cases(client, m.code)
@@ -171,22 +199,12 @@ async def plan_stage(
             actors={a.name for a in m.actors},
             fixtures={f.name for f in m.fixtures},
         )
-        async with sem:
-            deps.console.print(
-                f"  planning [bold]{m.code}[/] ({len(m.endpoints)} endpoints, {len(existing)} existing cases)..."
-            )
-            drafts, dropped = await planner.plan_module(
-                report.analysis,
-                m,
-                endpoints,
-                ctx,
-                [{k: v for k, v in e.items() if k != "fingerprint"} for e in existing],
-                model=deps.model,
-            )
-        summary.dropped_invalid += [(m.code, title, errs) for title, errs in dropped]
+        shown = [{k: v for k, v in e.items() if k != "fingerprint"} for e in existing]
+        chunks = [m.endpoints[i : i + chunk_size] for i in range(0, len(m.endpoints), chunk_size)] or [[]]
+        results = await asyncio.gather(*(plan_chunk(m, c, ctx, shown) for c in chunks))
         seen = {e["fingerprint"] for e in existing}
         fresh: list[CaseDraft] = []
-        for d in drafts:
+        for d in (d for drafts in results for d in drafts):
             fp = fingerprint(m.code, d, persisted.endpoint_paths)
             if fp in seen:
                 summary.duplicates.append((m.code, d.title))
@@ -275,7 +293,7 @@ async def build_stage(
     client = deps.client
     root = deps.settings.engine_dir("bruno")
     statuses = ["DRAFT", "READY"] + (["NEEDS_REVIEW"] if include_needs_review else [])
-    rows = await repo.load_cases(client, CaseFilter(flt.id_glob, flt.tags, statuses))
+    rows = await repo.load_cases(client, dataclasses.replace(flt, statuses=statuses))
     codes = await repo.list_modules(client)
     modules = {c: await repo.module_context(client, c) for c in codes}
     if not dry_run:
@@ -366,7 +384,7 @@ async def build_stage(
         return summary
 
     # full build: remove files of cases that are no longer selected (deprecated / needs review / deleted)
-    if not flt.id_glob and not flt.tags:
+    if not flt.narrowed:
         keep = {r.test_id for r in rows}
         for path in root.glob("*/TC-*.yml"):
             m = FILE_RE.match(path.name)
@@ -420,6 +438,7 @@ async def test_stage(
     env_name: str = "local",
     base_url: str | None = None,
     skip_health_check: bool = False,
+    kind: str = "SUITE",
 ) -> RunSummary:
     s = deps.settings
     client, store = deps.client, deps.store
@@ -428,13 +447,13 @@ async def test_stage(
     run_id = f"run-{datetime.now(UTC):%Y%m%d-%H%M%S}-{uuid.uuid4().hex[:6]}"
     rows = [
         r
-        for r in await repo.load_cases(client, CaseFilter(flt.id_glob, flt.tags, None))
+        for r in await repo.load_cases(client, dataclasses.replace(flt, statuses=None))
         if str(r.gen_status) == "GENERATED" and str(r.design_status) not in ("DEPRECATED",)
     ]
     summary = RunSummary(run_id=run_id, status="PENDING")
     codes = sorted({r.test_module.code for r in rows})
     await store.ensure_bucket()
-    await repo.create_run(client, run_id, codes, env_name, base_url, store.uri(run_prefix(run_id)))
+    await repo.create_run(client, run_id, codes, env_name, base_url, store.uri(run_prefix(run_id)), kind)
     if not rows:
         summary.status, summary.abort_reason = "ABORTED", "no generated test cases match (run `srg build` first)"
         await repo.finish_run(client, run_id, "ABORTED", summary.abort_reason)
@@ -466,7 +485,7 @@ async def test_stage(
         if _content_hash(docs) != hashes[tid]:
             summary.warnings.append(f"{tid}: files differ from the last build (edited by hand or stale)")
 
-    if flt.id_glob or flt.tags:
+    if flt.narrowed:
         paths = sorted(
             {f for fs in expected.values() for f in fs},
             key=lambda n: (n.split("/")[0], _sort_key(n.rsplit("/", 1)[-1])),
@@ -516,4 +535,416 @@ async def test_stage(
     else:
         summary.status = "COMPLETED"
     await repo.finish_run(client, run_id, summary.status, summary.abort_reason)
+    return summary
+
+
+# ---------------------------------------------------------------- diagnose
+
+
+@dataclass
+class DiagnosisRow:
+    test_id: str
+    param_index: int
+    category: str
+    confidence: float
+    source: str
+    root_cause: str
+    recommended_action: str
+    suggested_fix: str | None = None
+    rerun: str | None = None
+
+
+@dataclass
+class DiagnoseSummary:
+    run_id: str | None
+    rows: list[DiagnosisRow] = field(default_factory=list)
+    skipped_existing: int = 0
+    errors: list[tuple[str, int, str]] = field(default_factory=list)
+    groups: int = 0  # distinct failure signatures
+    llm_investigations: int = 0
+    not_diagnosed: int = 0  # over the max_llm budget
+
+
+def _failure_label(f: diagnostics.FailedExecution) -> str:
+    return f"{f.test_id}{chr(ord('a') + f.param_index)}"
+
+
+def _to_failure(row: Any, run_id: str) -> diagnostics.FailedExecution:
+    tc = row.test_case
+    ir = repo.row_to_ir(tc)
+    failed = row.failed_assertions
+    return diagnostics.FailedExecution(
+        execution_id=str(row.id),
+        run_id=run_id,
+        test_id=tc.test_id,
+        title=tc.title,
+        param_index=row.param_index,
+        status=str(row.status),
+        http_status=row.http_status,
+        error_message=row.error_message,
+        failed_assertions=json.loads(failed) if isinstance(failed, str) else (failed or []),
+        case_ir=ir.model_dump(mode="json", exclude_defaults=True),
+        endpoints=sorted(e.key for e in tc.endpoints),
+        requirement_ids=sorted(q.req_id for q in tc.requirements),
+        actor=tc.actor.name if tc.actor else None,
+    )
+
+
+async def diagnose_stage(
+    deps: GraphDependencies,
+    run_id: str | None = None,
+    flt: CaseFilter | None = None,
+    force: bool = False,
+    allow_rerun: bool = True,
+    max_llm: int = 30,
+    group: bool = True,
+) -> DiagnoseSummary:
+    """Triage the failed executions of a run.
+
+    Failures are grouped by signature; per group the rule-based pre-classifier or ONE diagnostics-agent
+    investigation (the .env model) decides, and the result is stored for every member of the group."""
+    client, store, s = deps.client, deps.store, deps.settings
+    run_id = run_id or await repo.latest_run_id(client)
+    summary = DiagnoseSummary(run_id=run_id)
+    if run_id is None:
+        return summary
+    flt = flt or CaseFilter()
+    selected = []
+    for row in await repo.failed_executions(client, run_id):
+        tc = row.test_case
+        if not flt.matches(tc.test_id, tc.tags):
+            continue
+        if row.diagnosis is not None and not force:
+            summary.skipped_existing += 1
+            continue
+        selected.append((row, _to_failure(row, run_id)))
+    groups: dict[tuple, list] = {}
+    for row, f in selected:
+        groups.setdefault(diagnostics.signature(f) if group else (f.execution_id,), []).append((row, f))
+    summary.groups = len(groups)
+    if not groups:
+        return summary
+
+    root = s.engine_dir("bruno")
+    manifest = load_manifest(deps)
+    sem = asyncio.Semaphore(s.srg_llm_concurrency)
+    rerun_lock = asyncio.Lock()  # reruns hit the SUT; keep them sequential
+    budget = {"left": max_llm}
+
+    async def save(failure: diagnostics.FailedExecution, result: Any, source: str, rerun_result: str | None) -> None:
+        await repo.save_diagnosis(
+            client, failure.execution_id, result, source, model_name() if source == "LLM" else None, rerun_result
+        )
+        if result.category == "TEST_DEFECT":
+            await repo.flag_test_defect(
+                client, failure.test_id, f"diagnosis {run_id}: TEST_DEFECT - {result.root_cause}"
+            )
+        summary.rows.append(
+            DiagnosisRow(
+                failure.test_id,
+                failure.param_index,
+                result.category,
+                result.confidence,
+                source,
+                result.root_cause,
+                result.recommended_action,
+                result.suggested_fix,
+                rerun_result,
+            )
+        )
+
+    async def one(members: list) -> None:
+        row, failure = members[0]
+        tid, pidx = failure.test_id, failure.param_index
+        failure.similar = [_failure_label(f) for _, f in members[1:]]
+        files = sorted(
+            (f for f, m in manifest.items() if m["test_id"] == tid and m["param_index"] == pidx),
+            key=lambda n: _sort_key(n.rsplit("/", 1)[-1]),
+        )
+
+        async def get_report() -> str:
+            try:
+                return await store.get_text(case_prefix(run_id, tid, pidx) + "report.json")
+            except Exception as exc:  # noqa: BLE001
+                return f"report not available: {exc.__class__.__name__}"
+
+        async def get_files() -> dict[str, str]:
+            return {f: (root / f).read_text() for f in files if (root / f).exists()} or {"-": "files not found"}
+
+        async def rerun() -> str:
+            if not files:
+                return "rerun impossible: files not found (run srg build)"
+            async with rerun_lock:
+                out_dir = s.reports_dir / "runs" / run_id / "rerun" / f"{tid}-{pidx}"
+                res = await run_bru(
+                    s.bru_bin,
+                    root,
+                    files,
+                    row.run.env_name or "local",
+                    {"baseUrl": row.run.base_url},
+                    dotenv_values(),
+                    out_dir,
+                    300,
+                )
+            oc = aggregate(res.results, manifest, {(tid, pidx): files})[(tid, pidx)]
+            detail = "; ".join(str(f.get("assertion") or f.get("test") or f.get("error")) for f in oc.failed[:5])
+            return f"{oc.status} (HTTP {oc.http_status}) {detail or oc.error_message or ''}".strip()
+
+        diag_deps = diagnostics.DiagDeps(
+            failure=failure,
+            get_report=get_report,
+            get_contracts=lambda: repo.endpoint_schemas(client, failure.endpoints),
+            get_requirements=lambda: repo.requirement_texts(client, tid),
+            get_files=get_files,
+            get_history=lambda: repo.case_history(client, tid, pidx),
+            rerun=rerun if allow_rerun else None,
+        )
+        result = diagnostics.preclassify(failure)
+        source = "RULE"
+        if result is None:
+            if budget["left"] <= 0:  # checked before the first await -> largest groups win the budget
+                summary.not_diagnosed += len(members)
+                return
+            budget["left"] -= 1
+            source = "LLM"
+        try:
+            if source == "LLM":
+                async with sem:
+                    deps.console.print(
+                        f"  diagnosing [bold]{_failure_label(failure)}[/] ({failure.status}, HTTP {failure.http_status})"
+                        + (f" + {len(members) - 1} similar" if len(members) > 1 else "")
+                        + "..."
+                    )
+                    summary.llm_investigations += 1
+                    result = await diagnostics.diagnose(diag_deps, model=deps.model)
+            await save(failure, result, source, diag_deps.rerun_result)
+            for _, other in members[1:]:
+                note = f"same failure signature as {_failure_label(failure)} ({len(members)} executions in this group)"
+                await save(other, result.model_copy(update={"evidence": [*result.evidence, note]}), source, None)
+        except Exception as exc:  # one failed triage must not stop the others
+            summary.errors.append((tid, pidx, f"{exc.__class__.__name__}: {str(exc)[:300]}"))
+
+    await asyncio.gather(*(one(m) for m in sorted(groups.values(), key=len, reverse=True)))
+    summary.rows.sort(key=lambda r: (r.test_id, r.param_index))
+    return summary
+
+
+# ---------------------------------------------------------------- heal
+
+
+@dataclass
+class HealRow:
+    test_id: str
+    status: str  # VERIFIED | ROLLED_BACK | UNVERIFIED | REJECTED | FAILED
+    attempts: int
+    change_summary: str
+    detail: str | None = None
+
+
+@dataclass
+class HealSummary:
+    run_id: str | None
+    rows: list[HealRow] = field(default_factory=list)
+    verify_run_ids: list[str] = field(default_factory=list)
+
+
+def _documented_statuses(schemas: dict[str, Any]) -> dict[str, set[int]]:
+    return {key: {int(c) for c in (info.get("responses") or {}) if str(c).isdigit()} for key, info in schemas.items()}
+
+
+def _outcome_text(outcomes: list[Any]) -> str:
+    lines = []
+    for o in outcomes:
+        fails = "; ".join(
+            str(f.get("assertion") or f.get("test") or f.get("error")) + f" -> {f.get('error')}" for f in o.failed[:5]
+        )
+        lines.append(
+            f"row {chr(ord('a') + o.param_index)}: {o.status} HTTP {o.http_status} {fails or o.error_message or ''}"
+        )
+    return "\n".join(lines)
+
+
+async def heal_stage(
+    deps: GraphDependencies,
+    run_id: str | None = None,
+    flt: CaseFilter | None = None,
+    verify: bool = True,
+    max_cases: int = 20,
+    max_attempts: int = 2,
+) -> HealSummary:
+    """Repair test cases whose failures were diagnosed as TEST_DEFECT, then rebuild and re-run them.
+
+    Verified heals are kept (READY, tag `healed`); heals that still fail after max_attempts are rolled back
+    to the previous version (NEEDS_REVIEW). Every attempt is recorded as a HealAttempt with before/after IR."""
+    client, store = deps.client, deps.store
+    run_id = run_id or await repo.latest_run_id(client)
+    summary = HealSummary(run_id=run_id)
+    if run_id is None:
+        return summary
+    flt = flt or CaseFilter()
+    by_case: dict[str, list[Any]] = {}
+    for ex in await repo.heal_candidates(client, run_id):
+        if flt.matches(ex.test_case.test_id, ex.test_case.tags):
+            by_case.setdefault(ex.test_case.test_id, []).append(ex)
+    test_ids = sorted(by_case)[:max_cases]
+    if not test_ids:
+        return summary
+
+    persisted = await repo.current_spec_ids(client)
+    sem = asyncio.Semaphore(deps.settings.srg_llm_concurrency)
+    state: dict[str, dict[str, Any]] = {}  # test_id -> before, healed, heal_id, attempts, code, ...
+
+    async def heal_one(test_id: str, previous_failure: str | None = None) -> bool:
+        st = state.setdefault(test_id, {"attempts": 0})
+        row = await repo.get_case(client, test_id)
+        code = row.test_module.code
+        current = CaseDraft.model_validate(repo.row_to_ir(row).model_dump(exclude={"id", "status"}))
+        st.setdefault("before", current)
+        st["code"] = code
+        module = await repo.module_context(client, code)
+        ctx = ValidationContext(
+            endpoint_paths=persisted.endpoint_paths,
+            requirement_ids=set(persisted.requirement_ids),
+            actors=set(module["actors"]),
+            fixtures=set(module["fixtures"]),
+        )
+        endpoints = sorted(e.key for e in row.endpoints)
+        schemas = await repo.endpoint_schemas(client, endpoints)
+        failures = by_case[test_id]
+        diagnoses = [
+            {
+                "row": chr(ord("a") + ex.param_index),
+                "http_status": ex.http_status,
+                "failed_assertions": ex.failed_assertions,
+                "root_cause": ex.diagnosis.root_cause,
+                "evidence": list(ex.diagnosis.evidence or []),
+                "suggested_fix": ex.diagnosis.suggested_fix,
+            }
+            for ex in failures
+        ]
+        exchanges = []
+        for ex in failures[:3]:
+            try:
+                exchanges.append(await store.get_text(case_prefix(run_id, test_id, ex.param_index) + "report.json"))
+            except Exception as exc:  # noqa: BLE001
+                exchanges.append(f"(report unavailable: {exc.__class__.__name__})")
+        prompt = healer.build_prompt(
+            current,
+            diagnoses,
+            "\n".join(exchanges),
+            schemas,
+            await repo.requirement_texts(client, test_id),
+            previous_failure,
+        )
+        hdeps = healer.HealDeps(original=current, ctx=ctx, documented_statuses=_documented_statuses(schemas))
+        st["attempts"] += 1
+        try:
+            async with sem:
+                deps.console.print(f"  healing [bold]{test_id}[/] (attempt {st['attempts']})...")
+                result = await healer.heal(prompt, hdeps, model=deps.model)
+        except Exception as exc:  # noqa: BLE001
+            st["final"] = HealRow(
+                test_id,
+                "FAILED",
+                st["attempts"],
+                "-",
+                f"{exc.__class__.__name__}: " + "; ".join(hdeps.last_errors[:3] or [str(exc)[:200]]),
+            )
+            return False
+        if result.unhealable_reason:
+            await repo.insert_heal_attempt(
+                client,
+                test_id,
+                run_id,
+                st["attempts"],
+                "REJECTED",
+                result.unhealable_reason,
+                current.model_dump(mode="json"),
+                current.model_dump(mode="json"),
+                model_name(),
+                str(failures[0].id),
+            )
+            st["final"] = HealRow(test_id, "REJECTED", st["attempts"], result.unhealable_reason)
+            return False
+        healed = result.case.model_copy(update={"tags": sorted({*result.case.tags, "healed"})})
+        await repo.replace_case(client, test_id, code, healed, persisted, "READY", None)
+        st["heal_id"] = await repo.insert_heal_attempt(
+            client,
+            test_id,
+            run_id,
+            st["attempts"],
+            "UNVERIFIED",
+            result.change_summary,
+            st["before"].model_dump(mode="json"),
+            healed.model_dump(mode="json"),
+            model_name(),
+            str(failures[0].id),
+        )
+        st["summary"] = result.change_summary
+        return True
+
+    healed_ok = await asyncio.gather(*(heal_one(t) for t in test_ids))
+    pending = [t for t, ok in zip(test_ids, healed_ok, strict=True) if ok]
+
+    while pending:
+        if not verify:
+            for t in pending:
+                state[t]["final"] = HealRow(t, "UNVERIFIED", state[t]["attempts"], state[t]["summary"])
+            break
+        ids = set(pending)
+        built = await build_stage(deps, CaseFilter(ids=ids), force=True)
+        build_failed = {t for t, _ in built.failed}
+        runnable = ids - build_failed
+        outcomes: dict[str, list[Any]] = {t: [] for t in ids}
+        verify_run = None
+        if runnable:
+            run = await test_stage(deps, CaseFilter(ids=runnable), kind="HEAL_VERIFY")
+            verify_run = run.run_id
+            summary.verify_run_ids.append(run.run_id)
+            for o in run.outcomes:
+                outcomes[o.test_id].append(o)
+        retry = []
+        for t in sorted(ids):
+            st = state[t]
+            ok = t in runnable and outcomes[t] and all(o.status == "PASSED" for o in outcomes[t])
+            text = (
+                _outcome_text(outcomes[t])
+                if outcomes[t]
+                else ("Bruno build failed: " + "; ".join(e for tid, errs in built.failed if tid == t for e in errs[:3]))
+            )
+            if ok:
+                await repo.finish_heal_attempt(client, st["heal_id"], "VERIFIED", verify_run, "all rows passed")
+                st["final"] = HealRow(t, "VERIFIED", st["attempts"], st["summary"])
+                continue
+            await repo.finish_heal_attempt(client, st["heal_id"], "ROLLED_BACK", verify_run, text[:2000])
+            if st["attempts"] < max_attempts:
+                retry.append((t, text))
+            else:
+                st["final"] = HealRow(t, "ROLLED_BACK", st["attempts"], st["summary"], text[:300])
+        if retry:
+            results = await asyncio.gather(*(heal_one(t, text) for t, text in retry))
+            pending = [t for (t, _), ok in zip(retry, results, strict=True) if ok]
+        else:
+            pending = []
+
+    # roll back every case whose heal could not be verified
+    rolled = [
+        t
+        for t, st in state.items()
+        if st.get("final") and st["final"].status in ("ROLLED_BACK", "FAILED") and "heal_id" in st
+    ]
+    for t in rolled:
+        st = state[t]
+        await repo.replace_case(
+            client,
+            t,
+            st["code"],
+            st["before"],
+            persisted,
+            "NEEDS_REVIEW",
+            f"auto-heal failed ({st['attempts']} attempts): {st['final'].detail or ''}"[:500],
+        )
+    if rolled:
+        await build_stage(deps, CaseFilter(ids=set(rolled)), force=True, include_needs_review=True)
+    summary.rows = sorted((st["final"] for st in state.values() if st.get("final")), key=lambda r: r.test_id)
     return summary

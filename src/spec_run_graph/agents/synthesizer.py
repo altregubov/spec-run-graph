@@ -203,7 +203,7 @@ def build_prompt(
         f"Fixture templates: {json.dumps(fixtures)}",
         f"Actors (Bruno auth blocks): {json.dumps(actors)}",
         "Test case (IR):\n" + yaml.safe_dump(case.model_dump(mode="json", exclude_defaults=True), sort_keys=False),
-        "Planned files, in run order:\n" + json.dumps(file_plan, indent=1),
+        "Planned files, in run order:\n" + json.dumps(file_plan),
     ]
     if preceding_delays:
         parts.append("Delays: " + "; ".join(preceding_delays))
@@ -227,6 +227,7 @@ async def synthesize(
             build_agent,
             build_prompt(case, module, planned, endpoints),
             SynthesizedFiles,
+            thinking=False,  # mechanical IR -> YAML translation; validated anyway
             deps=deps,
             model=model or build_model(),
         )

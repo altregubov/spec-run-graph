@@ -132,17 +132,17 @@ def build_prompt(
     )
     parts = [
         f"Product summary:\n{analysis.summary}",
-        f"Module:\n{json.dumps(module_info, indent=1)}",
+        f"Module:\n{json.dumps(module_info)}",
         "Endpoints of this module:\n" + "\n".join(endpoint_digest(e) for e in own),
         f"Other endpoints usable in workflows: {others}",
-        "Requirements:\n" + json.dumps([r.model_dump() for r in reqs], indent=1),
+        "Requirements:\n" + json.dumps([r.model_dump() for r in reqs]),
     ]
     if conflicts:
-        parts.append("Specification conflicts:\n" + json.dumps([c.model_dump() for c in conflicts], indent=1))
+        parts.append("Specification conflicts:\n" + json.dumps([c.model_dump() for c in conflicts]))
     if gaps:
-        parts.append("Known gaps:\n" + json.dumps([g.model_dump() for g in gaps], indent=1))
+        parts.append("Known gaps:\n" + json.dumps([g.model_dump() for g in gaps]))
     if existing:
-        parts.append("Already covered (do NOT repeat; add only what is missing):\n" + json.dumps(existing, indent=1))
+        parts.append("Already covered (do NOT repeat; add only what is missing):\n" + json.dumps(existing))
     else:
         parts.append("No test cases exist yet for this module.")
     return "\n\n".join(parts)

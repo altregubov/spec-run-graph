@@ -113,3 +113,25 @@ def test_chat_guard_allows_selects(q):
 def test_chat_guard_rejects_writes(q):
     with pytest.raises(ModelRetry):
         guard_query(q)
+
+
+async def test_run_structured_falls_back_to_prompted_on_broken_tool_json():
+    """Reproduces the 'expected , or }' failure: tool-call args are garbage, prompted text is fine."""
+    import json as _json
+
+    from pydantic_ai.messages import ModelResponse, TextPart, ToolCallPart
+    from pydantic_ai.models.function import FunctionModel
+
+    good = orders_analysis(orders_specs()).model_dump()
+    calls = {"tool": 0, "prompted": 0}
+
+    def fn(messages, info):
+        if info.output_tools:  # tool output mode -> always malformed JSON
+            calls["tool"] += 1
+            return ModelResponse(parts=[ToolCallPart(info.output_tools[0].name, '{"cases": true">{"cases"')])
+        calls["prompted"] += 1
+        return ModelResponse(parts=[TextPart(_json.dumps(good))])
+
+    out = await analyzer.analyze(orders_specs(), model=FunctionModel(fn))
+    assert [m.code for m in out.modules] == ["PROD", "ORD"]
+    assert calls["tool"] >= 2 and calls["prompted"] == 1

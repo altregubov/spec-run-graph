@@ -10,6 +10,9 @@ module default {
   scalar type StepType        extending enum<HTTP, DELAY>;
   scalar type RunStatus       extending enum<PENDING, RUNNING, COMPLETED, ABORTED>;
   scalar type ExecutionStatus extending enum<PASSED, FAILED, ERROR, TIMEOUT, SKIPPED>;
+  scalar type DiagnosticCategory extending enum<APPLICATION_BUG, SPEC_MISMATCH, TEST_DEFECT, ENV_FAILURE, FLAKY, UNKNOWN>;
+  scalar type DiagnosticSource extending enum<RULE, LLM>;
+  scalar type HealStatus extending enum<VERIFIED, ROLLED_BACK, UNVERIFIED, REJECTED>;
 
   abstract type Timestamped {
     required created_at: datetime { default := datetime_current(); readonly := true; }
@@ -120,6 +123,7 @@ module default {
     multi link steps := .<test_case[is TestStep];
     multi link endpoints := distinct .steps.endpoint;   # coverage, computed from steps
     multi link executions := .<test_case[is TestExecution];
+    multi link heals := .<test_case[is HealAttempt];
     # generation bookkeeping (LLM synthesizer)
     script_path: str;                    # relative to test_generated/bruno/ (first file of the case)
     script_hash: str;
@@ -169,6 +173,7 @@ module default {
     finished_at: datetime;
     log_prefix_uri: str;                 # s3://spec-run-telemetry/runs/<run_id>/
     abort_reason: str;                   # e.g. pre-flight health check failure
+    kind: str { default := 'SUITE'; }    # SUITE | HEAL_VERIFY
     multi link executions := .<run[is TestExecution];
   }
 
@@ -183,7 +188,36 @@ module default {
     error_message: str;
     log_uri: str;                        # s3://.../runs/<run_id>/<test_id>/<param>/
     script_hash: str;                    # which script revision ran
+    link diagnosis := assert_single(.<execution[is DiagnosticNote]);
     constraint exclusive on ((.run, .test_case, .param_index));
   }
-  # DiagnosticNote / DiagnosticCategory are added by migration when the diagnostics agent is built.
+
+  # ReAct failure triage result: one note per failed execution (re-diagnosis replaces it).
+  type DiagnosticNote extending Timestamped {
+    required execution: TestExecution { constraint exclusive; on target delete delete source; }
+    required category: DiagnosticCategory;
+    required source: DiagnosticSource;   # RULE = deterministic pre-classifier, LLM = diagnostics agent
+    required root_cause: str;
+    evidence: array<str>;
+    recommended_action: str;
+    suggested_fix: str;                  # for TEST_DEFECT: what to change in the test case
+    required confidence: float64 { constraint min_value(0); constraint max_value(1); }
+    rerun_status: str;                   # result of the agent's confirmation rerun (flakiness check)
+    model_name: str;
+  }
+
+  # Self-healing of TEST_DEFECT failures: audit trail with before/after IR (enables rollback).
+  type HealAttempt extending Timestamped {
+    required test_case: TestCase { on target delete delete source; }
+    diagnosis: DiagnosticNote { on target delete allow; }
+    required run_id: str;                # run whose failure triggered the heal
+    required attempt: int16;             # 1, 2 ... per case and run
+    required status: HealStatus;
+    required change_summary: str;
+    required before_ir: json;
+    required after_ir: json;
+    verify_run_id: str;                  # verification run
+    verify_result: str;
+    model_name: str;
+  }
 }

@@ -3,7 +3,9 @@
 RouteNode -> AnalyzeNode -(stop=analyze)-> End
           -> PlanNode    -(stop=plan)----> End        (stores test cases in Gel)
           -> BuildNode   -(stop=build)---> End        (LLM implements them as Bruno files)
-          -> TestNode    ----------------> End        (health check + bru run + results)
+          -> TestNode    -(all passed)---> End        (health check + bru run + results)
+          -> DiagnoseNode -(no heal)-----> End        (failure triage: rules + diagnostics agent)
+          -> HealNode ------------------> End         (repair TEST_DEFECT cases, rebuild, verify/rollback)
 """
 
 from __future__ import annotations
@@ -21,8 +23,8 @@ from spec_run_graph.knowledge.repo import CaseFilter
 from spec_run_graph.pipeline import stages
 from spec_run_graph.specs.models import LoadedSpec
 
-Stage = Literal["analyze", "plan", "build", "test"]
-ORDER: list[Stage] = ["analyze", "plan", "build", "test"]
+Stage = Literal["analyze", "plan", "build", "test", "diagnose", "heal"]
+ORDER: list[Stage] = ["analyze", "plan", "build", "test", "diagnose", "heal"]
 
 
 @dataclass
@@ -41,12 +43,20 @@ class PipelineGraphState:
     env_name: str = "local"
     base_url: str | None = None
     skip_health_check: bool = False
+    diagnose_run_id: str | None = None  # None = the run just executed / the latest run
+    rerun_failures: bool = True  # let the diagnostics agent re-run a failed case once (flakiness check)
+    max_llm_diagnoses: int = 30  # LLM investigations per diagnose run (one per failure group)
+    group_failures: bool = True  # diagnose one representative per failure signature
+    heal_verify: bool = True  # rebuild + re-run healed cases; roll back heals that still fail
+    max_heal_cases: int = 20
     # results
     specs: list[LoadedSpec] = field(default_factory=list)
     report: AnalysisReport | None = None
     plan: stages.PlanSummary | None = None
     build: stages.BuildSummary | None = None
     run: stages.RunSummary | None = None
+    diagnosis: stages.DiagnoseSummary | None = None
+    healing: stages.HealSummary | None = None
 
     def stops_after(self, stage: Stage) -> bool:
         return ORDER.index(stage) >= ORDER.index(self.stop)
@@ -56,13 +66,43 @@ Ctx = GraphRunContext[PipelineGraphState, GraphDependencies]
 
 
 @dataclass
+class HealNode(BaseNode[PipelineGraphState, GraphDependencies, PipelineGraphState]):
+    async def run(self, ctx: Ctx) -> End[PipelineGraphState]:
+        s = ctx.state
+        run_id = s.diagnose_run_id or (s.run.run_id if s.run else None)
+        s.healing = await stages.heal_stage(
+            ctx.deps, run_id, s.case_filter, verify=s.heal_verify, max_cases=s.max_heal_cases
+        )
+        return End(s)
+
+
+@dataclass
+class DiagnoseNode(BaseNode[PipelineGraphState, GraphDependencies, PipelineGraphState]):
+    async def run(self, ctx: Ctx) -> HealNode | End[PipelineGraphState]:
+        s = ctx.state
+        run_id = s.diagnose_run_id or (s.run.run_id if s.run else None)
+        s.diagnosis = await stages.diagnose_stage(
+            ctx.deps,
+            run_id,
+            s.case_filter,
+            force=s.force,
+            allow_rerun=s.rerun_failures,
+            max_llm=s.max_llm_diagnoses,
+            group=s.group_failures,
+        )
+        defects = any(r.category == "TEST_DEFECT" for r in s.diagnosis.rows)
+        return HealNode() if defects and not s.stops_after("diagnose") else End(s)
+
+
+@dataclass
 class TestNode(BaseNode[PipelineGraphState, GraphDependencies, PipelineGraphState]):
     __test__ = False
 
-    async def run(self, ctx: Ctx) -> End[PipelineGraphState]:
+    async def run(self, ctx: Ctx) -> DiagnoseNode | End[PipelineGraphState]:
         s = ctx.state
         s.run = await stages.test_stage(ctx.deps, s.case_filter, s.env_name, s.base_url, s.skip_health_check)
-        return End(s)
+        failed = s.run.status == "COMPLETED" and any(o.status != "PASSED" for o in s.run.outcomes)
+        return DiagnoseNode() if failed and not s.stops_after("test") else End(s)
 
 
 @dataclass
@@ -94,7 +134,7 @@ class AnalyzeNode(BaseNode[PipelineGraphState, GraphDependencies, PipelineGraphS
 
 @dataclass
 class RouteNode(BaseNode[PipelineGraphState, GraphDependencies, PipelineGraphState]):
-    async def run(self, ctx: Ctx) -> AnalyzeNode | PlanNode | BuildNode | TestNode:
+    async def run(self, ctx: Ctx) -> AnalyzeNode | PlanNode | BuildNode | TestNode | DiagnoseNode | HealNode:
         start = ctx.state.start
         if start == "analyze":
             return AnalyzeNode()
@@ -102,6 +142,10 @@ class RouteNode(BaseNode[PipelineGraphState, GraphDependencies, PipelineGraphSta
             return PlanNode()
         if start == "build":
             return BuildNode()
+        if start == "diagnose":
+            return DiagnoseNode()
+        if start == "heal":
+            return HealNode()
         return TestNode()
 
 
@@ -121,6 +165,8 @@ def build_graph():
         g.node(PlanNode),
         g.node(BuildNode),
         g.node(TestNode),
+        g.node(DiagnoseNode),
+        g.node(HealNode),
     )
     return g.build(validate_graph_structure=False)
 

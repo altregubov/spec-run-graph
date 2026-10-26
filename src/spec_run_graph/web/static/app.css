@@ -84,3 +84,10 @@ tr.uncovered td:first-child { box-shadow: inset 3px 0 0 var(--bad); }
   .chat-toggle { display: inline-block; }
   main { padding: 16px; }
 }
+.pill.diag-application_bug { background: var(--bad-soft); color: var(--bad); border-color: transparent; }
+.pill.diag-spec_mismatch, .pill.diag-test_defect { background: var(--warn-soft); color: var(--warn); border-color: transparent; }
+.pill.diag-env_failure, .pill.diag-flaky { background: var(--accent-soft); color: var(--accent); border-color: transparent; }
+td ul { margin: 4px 0 0 16px; padding: 0; }
+.pill.heal-verified { background: var(--ok-soft); color: var(--ok); border-color: transparent; }
+.pill.heal-rolled_back { background: var(--bad-soft); color: var(--bad); border-color: transparent; }
+.pill.heal-unverified, .pill.heal-rejected { background: var(--warn-soft); color: var(--warn); border-color: transparent; }

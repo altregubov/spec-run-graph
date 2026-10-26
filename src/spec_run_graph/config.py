@@ -19,8 +19,12 @@ class Settings(BaseSettings):
     opencode_base_url: str = "https://opencode.ai/inference/go/openai/v1"
     srg_model: str = "glm-5.3"
     srg_output_mode: Literal["tool", "native", "prompted"] = "tool"
-    srg_llm_concurrency: int = 4
+    srg_llm_concurrency: int = 8
     srg_llm_retries: int = 3
+    srg_plan_chunk_size: int = 3  # max endpoints per planner call (keeps LLM answers small)
+    # auto: reasoning on for analyze/plan, off for the Bruno synthesizer (mechanical, many calls)
+    srg_thinking: Literal["auto", "on", "off"] = "auto"
+    srg_max_tokens: int | None = None  # output token limit per call (None = provider default)
 
     # Gel
     gel_dsn: str = "gel://admin@localhost:5656/main"

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import fnmatch
+import json
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -478,25 +479,29 @@ async def insert_cases(
                     params=to_json(case.parameters) if case.parameters else None,
                     results=case.expected_results,
                 )
-                for row in _step_rows(case, persisted):
-                    await tx.query(
-                        """
-                        insert TestStep {
-                            test_case := (select TestCase filter .test_id = <str>$tid),
-                            seq := <int16>$seq, is_cleanup := <bool>$is_cleanup, name := <str>$name,
-                            step_type := <StepType><str>$step_type,
-                            endpoint := (select ApiEndpoint filter .id = <optional uuid>$endpoint),
-                            method := <HttpMethod><optional str>$method, path := <optional str>$path,
-                            request := <optional json>$request, expected_status := <optional str>$expected_status,
-                            validate_schema := <bool>$validate_schema, extract := <optional json>$extract,
-                            assertions := <optional json>$assertions, poll := <optional json>$poll,
-                            delay_ms := <optional int32>$delay_ms, timeout_ms := <optional int32>$timeout_ms,
-                        }
-                        """,
-                        tid=test_id,
-                        **row,
-                    )
+                await _insert_steps(tx, test_id, case, persisted)
     return ids
+
+
+async def _insert_steps(tx: Client, test_id: str, case: CaseDraft, persisted: PersistedSpecs) -> None:
+    for row in _step_rows(case, persisted):
+        await tx.query(
+            """
+            insert TestStep {
+                test_case := (select TestCase filter .test_id = <str>$tid),
+                seq := <int16>$seq, is_cleanup := <bool>$is_cleanup, name := <str>$name,
+                step_type := <StepType><str>$step_type,
+                endpoint := (select ApiEndpoint filter .id = <optional uuid>$endpoint),
+                method := <HttpMethod><optional str>$method, path := <optional str>$path,
+                request := <optional json>$request, expected_status := <optional str>$expected_status,
+                validate_schema := <bool>$validate_schema, extract := <optional json>$extract,
+                assertions := <optional json>$assertions, poll := <optional json>$poll,
+                delay_ms := <optional int32>$delay_ms, timeout_ms := <optional int32>$timeout_ms,
+            }
+            """,
+            tid=test_id,
+            **row,
+        )
 
 
 CASE_SHAPE = """
@@ -557,6 +562,19 @@ class CaseFilter:
     tags: list[str] = field(default_factory=list)
     statuses: list[str] | None = None  # DesignStatus names; None = everything
     needs_review: bool = False
+    ids: set[str] | None = None  # explicit test ids (e.g. the cases the healer just changed)
+
+    @property
+    def narrowed(self) -> bool:
+        """True when only part of the suite is selected."""
+        return bool(self.id_glob or self.tags or self.ids is not None)
+
+    def matches(self, test_id: str, tags: list[str] | None) -> bool:
+        if self.ids is not None and test_id not in self.ids:
+            return False
+        if self.id_glob and not fnmatch.fnmatch(test_id, self.id_glob):
+            return False
+        return not (self.tags and not set(self.tags) & set(tags or []))
 
 
 async def load_cases(client: Client, flt: CaseFilter | None = None) -> list[Any]:
@@ -565,9 +583,7 @@ async def load_cases(client: Client, flt: CaseFilter | None = None) -> list[Any]
     rows = await client.query(f"select TestCase {{ {CASE_SHAPE} }} order by .test_module.code then .test_id")
     out = []
     for r in rows:
-        if flt.id_glob and not fnmatch.fnmatch(r.test_id, flt.id_glob):
-            continue
-        if flt.tags and not set(flt.tags) & set(r.tags or []):
+        if not flt.matches(r.test_id, r.tags):
             continue
         status = str(r.design_status)
         if flt.needs_review and status != "NEEDS_REVIEW":
@@ -649,16 +665,19 @@ async def record_generation(
 # ---------------------------------------------------------------- runs
 
 
-async def create_run(client: Client, run_id: str, codes: list[str], env: str, base_url: str, prefix: str) -> None:
+async def create_run(
+    client: Client, run_id: str, codes: list[str], env: str, base_url: str, prefix: str, kind: str = "SUITE"
+) -> None:
     await client.query(
         """
         insert TestRun {
             run_id := <str>$run_id, engine := (select TestEngine filter .name = 'bruno'),
             modules := (select TestModule filter .code in array_unpack(<array<str>>$codes)),
             status := RunStatus.RUNNING, env_name := <str>$env, base_url := <str>$base,
-            started_at := datetime_current(), log_prefix_uri := <str>$prefix,
+            started_at := datetime_current(), log_prefix_uri := <str>$prefix, kind := <str>$kind,
         }
         """,
+        kind=kind,
         run_id=run_id,
         codes=codes,
         env=env,
@@ -704,3 +723,247 @@ async def insert_execution(client: Client, run_id: str, test_id: str, param_inde
         log_uri=fields.get("log_uri"),
         script_hash=fields.get("script_hash"),
     )
+
+
+# ---------------------------------------------------------------- diagnostics
+
+
+async def latest_run_id(client: Client) -> str | None:
+    return await client.query_single(
+        """select (select TestRun filter .status = RunStatus.COMPLETED and (.kind ?? 'SUITE') = 'SUITE'
+                   order by .started_at desc limit 1).run_id"""
+    )
+
+
+async def failed_executions(client: Client, run_id: str) -> list[Any]:
+    return list(
+        await client.query(
+            f"""
+            select TestExecution {{
+                id, param_index, status, http_status, failed_assertions, error_message, log_uri,
+                run: {{ run_id, base_url, env_name }},
+                diagnosis: {{ category }},
+                test_case: {{ {CASE_SHAPE} }},
+            }}
+            filter .run.run_id = <str>$run_id
+               and .status in {{ExecutionStatus.FAILED, ExecutionStatus.ERROR, ExecutionStatus.TIMEOUT}}
+            order by .test_case.test_id then .param_index
+            """,
+            run_id=run_id,
+        )
+    )
+
+
+async def case_history(client: Client, test_id: str, param_index: int, limit: int = 10) -> list[dict[str, Any]]:
+    raw = await client.query_json(
+        """
+        select TestExecution { run_id := .run.run_id, status, http_status, created_at,
+                               category := .diagnosis.category }
+        filter .test_case.test_id = <str>$t and .param_index = <int16>$p
+        order by .created_at desc limit <int64>$limit
+        """,
+        t=test_id,
+        p=param_index,
+        limit=limit,
+    )
+    return json.loads(raw)
+
+
+async def requirement_texts(client: Client, test_id: str) -> list[dict[str, Any]]:
+    rows = await client.query(
+        """select (select TestCase filter .test_id = <str>$t).requirements {
+               req_id, description, acceptance_criteria, spec_name := .spec.name }""",
+        t=test_id,
+    )
+    return [
+        {
+            "req_id": r.req_id,
+            "spec": r.spec_name,
+            "description": r.description,
+            "acceptance_criteria": list(r.acceptance_criteria or []),
+        }
+        for r in rows
+    ]
+
+
+async def save_diagnosis(
+    client: Client, execution_id: str, d: Any, source: str, model: str | None, rerun_status: str | None
+) -> None:
+    await client.query(
+        """
+        with ex := (select TestExecution filter .id = <uuid>$ex)
+        insert DiagnosticNote {
+            execution := ex, category := <DiagnosticCategory><str>$cat, source := <DiagnosticSource><str>$src,
+            root_cause := <str>$root, evidence := <array<str>>$ev, recommended_action := <optional str>$action,
+            suggested_fix := <optional str>$fix, confidence := <float64>$conf,
+            rerun_status := <optional str>$rerun, model_name := <optional str>$model,
+        } unless conflict on .execution else (
+            update DiagnosticNote set {
+                category := <DiagnosticCategory><str>$cat, source := <DiagnosticSource><str>$src,
+                root_cause := <str>$root, evidence := <array<str>>$ev, recommended_action := <optional str>$action,
+                suggested_fix := <optional str>$fix, confidence := <float64>$conf,
+                rerun_status := <optional str>$rerun, model_name := <optional str>$model,
+                updated_at := datetime_current(),
+            }
+        )
+        """,
+        ex=execution_id,
+        cat=d.category,
+        src=source,
+        root=d.root_cause,
+        ev=[str(e) for e in d.evidence],
+        action=d.recommended_action,
+        fix=d.suggested_fix,
+        conf=float(d.confidence),
+        rerun=rerun_status,
+        model=model,
+    )
+
+
+async def flag_test_defect(client: Client, test_id: str, reason: str) -> None:
+    await client.query(
+        """update TestCase filter .test_id = <str>$t and .design_status != DesignStatus.DEPRECATED
+           set { design_status := DesignStatus.NEEDS_REVIEW, review_reason := <str>$r, updated_at := datetime_current() }""",
+        t=test_id,
+        r=reason[:500],
+    )
+
+
+# ---------------------------------------------------------------- self-healing
+
+
+async def current_spec_ids(client: Client) -> PersistedSpecs:
+    """Endpoint / requirement ids of the latest version of every spec (to (re)write test steps)."""
+    out = PersistedSpecs()
+    latest = "(select FeatureSpec filter not exists .<previous[is FeatureSpec])"
+    for e in await client.query(f"select ApiEndpoint {{ id, key, path }} filter .spec in {latest}"):
+        out.endpoint_ids[e.key] = str(e.id)
+        out.endpoint_paths[e.key] = e.path
+    for r in await client.query(f"select Requirement {{ id, req_id }} filter .spec in {latest}"):
+        out.requirement_ids[r.req_id] = str(r.id)
+    return out
+
+
+async def replace_case(
+    client: gel.AsyncIOClient,
+    test_id: str,
+    code: str,
+    case: CaseDraft,
+    persisted: PersistedSpecs,
+    design_status: str,
+    review_reason: str | None,
+) -> None:
+    """Overwrite a case's content (same test id) and its steps in one transaction; it must be rebuilt after."""
+    req_ids = [persisted.requirement_ids[r] for r in case.coverage.requirement_refs if r in persisted.requirement_ids]
+    async for tx in client.transaction():
+        async with tx:
+            await tx.query("delete TestStep filter .test_case.test_id = <str>$t", t=test_id)
+            await tx.query(
+                """
+                with tc := (select TestCase filter .test_id = <str>$t)
+                update tc set {
+                    title := <str>$title, case_type := <TestCaseType><str>$type, priority := <Priority><str>$prio,
+                    fingerprint := <str>$fp, tags := <array<str>>$tags,
+                    actor := (select Actor filter .test_module = tc.test_module and .name = <optional str>$actor),
+                    requirements := (select Requirement filter .id in array_unpack(<array<uuid>>$reqs)),
+                    preconditions := <array<str>>$pre, variables := <optional json>$vars,
+                    parameters := <optional json>$params, expected_results := <array<str>>$results,
+                    design_status := <DesignStatus><str>$status, review_reason := <optional str>$reason,
+                    gen_status := GenStatus.PENDING, ir_hash := {}, updated_at := datetime_current(),
+                }
+                """,
+                t=test_id,
+                title=case.title,
+                type=case.type.upper(),
+                prio=case.priority,
+                fp=fingerprint(code, case, persisted.endpoint_paths),
+                tags=case.tags,
+                actor=case.actor,
+                reqs=req_ids,
+                pre=case.preconditions,
+                vars=to_json(case.variables) if case.variables else None,
+                params=to_json(case.parameters) if case.parameters else None,
+                results=case.expected_results,
+                status=design_status,
+                reason=review_reason,
+            )
+            await _insert_steps(tx, test_id, case, persisted)
+
+
+async def insert_heal_attempt(
+    client: Client,
+    test_id: str,
+    run_id: str,
+    attempt: int,
+    status: str,
+    change_summary: str,
+    before_ir: Any,
+    after_ir: Any,
+    model: str | None,
+    diagnosis_execution_id: str | None = None,
+) -> str:
+    row = await client.query_required_single(
+        """
+        insert HealAttempt {
+            test_case := (select TestCase filter .test_id = <str>$t),
+            diagnosis := (select DiagnosticNote filter .execution.id = <optional uuid>$ex),
+            run_id := <str>$run, attempt := <int16>$attempt, status := <HealStatus><str>$status,
+            change_summary := <str>$summary, before_ir := <json>$before, after_ir := <json>$after,
+            model_name := <optional str>$model,
+        }
+        """,
+        t=test_id,
+        ex=diagnosis_execution_id,
+        run=run_id,
+        attempt=attempt,
+        status=status,
+        summary=change_summary,
+        before=to_json(before_ir),
+        after=to_json(after_ir),
+        model=model,
+    )
+    return str(row.id)
+
+
+async def finish_heal_attempt(
+    client: Client, heal_id: str, status: str, verify_run_id: str | None, verify_result: str | None
+) -> None:
+    await client.query(
+        """update HealAttempt filter .id = <uuid>$id set {
+               status := <HealStatus><str>$status, verify_run_id := <optional str>$run,
+               verify_result := <optional str>$result, updated_at := datetime_current() }""",
+        id=heal_id,
+        status=status,
+        run=verify_run_id,
+        result=verify_result,
+    )
+
+
+async def heal_candidates(client: Client, run_id: str) -> list[Any]:
+    """Failed executions of a run diagnosed as TEST_DEFECT (with enough confidence)."""
+    return list(
+        await client.query(
+            """
+            select TestExecution {
+                id, param_index, http_status, failed_assertions, error_message,
+                test_case: { test_id, tags, test_module: { code } },
+                diagnosis: { root_cause, evidence, suggested_fix, recommended_action, confidence },
+            }
+            filter .run.run_id = <str>$run and .diagnosis.category = DiagnosticCategory.TEST_DEFECT
+               and .diagnosis.confidence >= 0.5
+               and .test_case.design_status != DesignStatus.DEPRECATED
+            order by .test_case.test_id then .param_index
+            """,
+            run=run_id,
+        )
+    )
+
+
+async def heal_history(client: Client, test_id: str) -> list[dict[str, Any]]:
+    raw = await client.query_json(
+        """select HealAttempt { run_id, attempt, status, change_summary, verify_run_id, verify_result,
+                                model_name, created_at }
+           filter .test_case.test_id = <str>$t order by .created_at desc""",
+        t=test_id,
+    )
+    return json.loads(raw)

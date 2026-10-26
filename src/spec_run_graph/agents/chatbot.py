@@ -134,13 +134,14 @@ def build_agent() -> Agent[ChatDeps, str]:
 
     @agent.tool
     async def run_results(ctx: RunContext[ChatDeps], run_id: str) -> str:
-        """Per-case results of one run (status, HTTP code, failed assertions)."""
+        """Per-case results of one run (status, HTTP code, failed assertions, failure diagnosis)."""
         traced("run_results", {"run_id": run_id}, ctx)
         return _dump(await stats.run_results(ctx.deps.client, run_id) or f"no run {run_id}")
 
     @agent.tool
     async def failing_cases(ctx: RunContext[ChatDeps], last_n_runs: int = 1) -> str:
-        """Failed/errored executions of the last N completed runs."""
+        """Failed/errored executions of the last N completed runs, with their diagnosis (APPLICATION_BUG,
+        SPEC_MISMATCH, TEST_DEFECT, ENV_FAILURE, FLAKY, UNKNOWN), root cause and recommended action."""
         traced("failing_cases", {"last_n_runs": last_n_runs}, ctx)
         return _dump(await stats.failing_cases(ctx.deps.client, max(1, min(last_n_runs, 20))))
 

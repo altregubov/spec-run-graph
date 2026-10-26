@@ -121,7 +121,7 @@ async def list_runs(client: gel.AsyncIOExecutor, limit: int = 20) -> list[dict[s
     raw = await client.query_json(
         """
         select TestRun {
-            run_id, status, base_url, started_at, finished_at, abort_reason, log_prefix_uri,
+            run_id, status, base_url, started_at, finished_at, abort_reason, log_prefix_uri, kind,
             module_codes := array_agg(.modules.code),
             total := count(.executions),
             passed := count(.executions filter .status = ExecutionStatus.PASSED),
@@ -143,6 +143,8 @@ async def run_results(client: gel.AsyncIOExecutor, run_id: str) -> dict[str, Any
             executions: {
                 test_id := .test_case.test_id, title := .test_case.title, param_index, status, http_status,
                 duration_ms, failed_assertions, error_message, log_uri,
+                diagnosis: { category, source, confidence, root_cause, evidence, recommended_action,
+                             suggested_fix, rerun_status, model_name },
             } order by .test_id then .param_index,
         } filter .run_id = <str>$run_id
         """,
@@ -158,10 +160,12 @@ async def run_results(client: gel.AsyncIOExecutor, run_id: str) -> dict[str, Any
 async def failing_cases(client: gel.AsyncIOExecutor, last_n_runs: int = 1) -> list[dict[str, Any]]:
     raw = await client.query_json(
         """
-        with runs := (select TestRun filter .status = RunStatus.COMPLETED order by .started_at desc limit <int64>$n)
+        with runs := (select TestRun filter .status = RunStatus.COMPLETED and (.kind ?? 'SUITE') = 'SUITE'
+                      order by .started_at desc limit <int64>$n)
         select TestExecution {
             run_id := .run.run_id, test_id := .test_case.test_id, title := .test_case.title,
             param_index, status, http_status, failed_assertions, error_message,
+            diagnosis: { category, confidence, root_cause, recommended_action, suggested_fix },
         }
         filter .run in runs and .status in {ExecutionStatus.FAILED, ExecutionStatus.ERROR, ExecutionStatus.TIMEOUT}
         order by .run.started_at desc then .test_id

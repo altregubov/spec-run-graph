@@ -27,6 +27,21 @@
       {% else %}<tr><td colspan="5" class="muted">not executed yet</td></tr>{% endfor %}
       </tbody>
     </table></div>
+    {% if heals %}
+    <h3>Self-healing</h3>
+    <div class="table-wrap"><table>
+      <thead><tr><th>When</th><th>Attempt</th><th>Result</th><th>Change</th></tr></thead>
+      <tbody>
+      {% for h in heals %}
+      <tr><td class="small">{{ h.created_at[:19] | replace("T", " ") }}<div class="muted">run {{ h.run_id }}</div></td>
+        <td>{{ h.attempt }}</td>
+        <td><span class="pill heal-{{ h.status | lower }}">{{ h.status }}</span>
+          {% if h.verify_run_id %}<div class="small"><a href="/runs/{{ h.verify_run_id }}">verification run</a></div>{% endif %}</td>
+        <td class="small">{{ h.change_summary }}{% if h.verify_result and h.status != "VERIFIED" %}<div class="err">{{ h.verify_result }}</div>{% endif %}</td></tr>
+      {% endfor %}
+      </tbody>
+    </table></div>
+    {% endif %}
   </div>
 </section>
 {% endblock %}

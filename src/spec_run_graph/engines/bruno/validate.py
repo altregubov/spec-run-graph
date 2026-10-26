@@ -21,6 +21,7 @@ from spec_run_graph.engines.bruno.scaffold import fixture_var
 
 SCHEMA_PATH = Path(__file__).with_name("opencollection.schema.json")
 TEMPLATE_RE = re.compile(r"\{\{(.*?)\}\}")
+HEADER_KEY_RE = re.compile(r"res\.headers\[\s*['\"]([^'\"]+)['\"]\s*\]")
 IR_SYNTAX_RE = re.compile(r"\{\{\s*\$(faker|fixture|env|extract|param|var)\.")
 STATIC_DYNAMIC = {"guid", "timestamp", "isoTimestamp"} | BRUNO_DYNAMIC
 
@@ -148,6 +149,12 @@ def validate_files(
                 errors.append(
                     f"{where}: template '{{{{{raw}}}}}' is not allowed (use baseUrl, process.env.X, "
                     f"{sorted(fixture_vars) or 'fixture vars'}, {prefix}<name> or a Bruno $random* variable)"
+                )
+        for key in HEADER_KEY_RE.findall(content):
+            if key != key.lower():
+                errors.append(
+                    f"{where}: response header keys are lower-case in Bruno: use res.headers['{key.lower()}'] "
+                    f"or res.getHeader('{key}') instead of res.headers['{key}']"
                 )
         for secret in secrets:
             if secret and secret in content:

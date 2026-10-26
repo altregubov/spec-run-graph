@@ -60,3 +60,23 @@ def test_v2_diff_detects_changed_endpoint():
     )
     assert ch.changed == ["POST /v1/orders"] and not ch.added and not ch.removed
     assert ch.affected == {"POST /v1/orders"}
+
+
+def test_swagger2_is_discovered_and_parsed(tmp_path):
+    import shutil
+
+    from spec_run_graph.specs.loader import load_specs
+
+    shutil.copy(ROOT / "tests" / "fixtures" / "swagger2.yaml", tmp_path / "swagger.yaml")
+    (tmp_path / "config.yaml").write_text("not: an api spec\n")
+    skipped = []
+    (spec,) = load_specs([tmp_path], skipped)
+    assert [p.name for p in skipped] == ["config.yaml"]
+    assert (spec.name, spec.version, spec.servers) == ("Pets API", "2.1", ["http://localhost:9999/api"])
+    idx = spec.endpoint_index()
+    assert set(idx) == {"GET /api/pets/{petId}", "POST /api/pets"}  # basePath is part of the path
+    get = idx["GET /api/pets/{petId}"]
+    assert get.requires_auth and not idx["POST /api/pets"].requires_auth
+    assert get.parameters[0]["schema"] == {"type": "string", "format": "uuid"}
+    assert get.response_schemas["200"]["schema"]["required"] == ["name"]  # $ref resolved
+    assert idx["POST /api/pets"].request_schema["properties"]["age"]["minimum"] == 0

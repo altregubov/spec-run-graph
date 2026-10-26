@@ -11,7 +11,7 @@ import re
 from typing import Any
 
 import yaml
-from pydantic_ai.messages import ModelMessage, ModelResponse, ToolCallPart, UserPromptPart
+from pydantic_ai.messages import ModelMessage, ModelResponse, TextPart, ToolCallPart, UserPromptPart
 from pydantic_ai.models.function import AgentInfo, FunctionModel
 
 from spec_run_graph.domain.expr import parse_check
@@ -36,6 +36,8 @@ def _section(prompt: str, head: str) -> str:
 
 
 def _respond(info: AgentInfo, args: dict[str, Any]) -> ModelResponse:
+    if not info.output_tools:  # prompted output mode: answer with JSON text
+        return ModelResponse(parts=[TextPart(json.dumps(args))])
     return ModelResponse(parts=[ToolCallPart(info.output_tools[0].name, args)])
 
 
@@ -202,4 +204,26 @@ def synthesizer_model(break_first: bool = False) -> FunctionModel:
         return _respond(info, {"files": files})
 
     fn.state = state  # type: ignore[attr-defined]
+    return FunctionModel(fn)
+
+
+def routed_model(**handlers: Any) -> FunctionModel:
+    """One test model for several agents: dispatch on the output schema's first required field.
+
+    e.g. routed_model(files=synthesizer_model(), case=heal_fn, category=diagnose_fn)"""
+
+    def fn(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        props: list[str] = []
+        if info.output_tools:
+            schema = info.output_tools[0].parameters_json_schema
+            props = list(schema.get("required") or schema.get("properties") or [])
+        else:  # prompted mode: the schema is embedded in the instructions
+            text = json.dumps([str(getattr(p, "content", "")) for m in messages for p in getattr(m, "parts", [])])
+            props = [k for k in handlers if f'\\\\"{k}\\\\"' in text or f'"{k}"' in text]
+        for key in props:
+            if key in handlers:
+                handler = handlers[key]
+                return (handler.function if isinstance(handler, FunctionModel) else handler)(messages, info)
+        raise AssertionError(f"no fake handler for output fields {props}")
+
     return FunctionModel(fn)

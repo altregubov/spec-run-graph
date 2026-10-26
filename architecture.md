@@ -2,7 +2,7 @@
 
 This document is the technical blueprint of **SpecRunGraph**. It covers the 5-plane separation of concerns, the Gel Knowledge Plane schema, the MinIO raw-telemetry tier, and the staged pipeline that turns specifications into executed Bruno API tests.
 
-> **Iteration 1 scope:** a local CLI (`srg`), API (HTTP) tests only, the Bruno engine (OpenCollection YAML), Gel and MinIO in Docker, LLMs from OpenCode Go, and a local web dashboard with a QA chatbot. ReAct failure triage (§4) is designed but deferred.
+> **Iteration 1 scope:** a local CLI (`srg`), API (HTTP) tests only, the Bruno engine (OpenCollection YAML), Gel and MinIO in Docker, LLMs from OpenCode Go, and a local web dashboard with a QA chatbot. failed tests are triaged by a diagnostics agent (§4).
 
 ---
 
@@ -25,7 +25,8 @@ flowchart TD
         Planner["Test Planner"]
         CodeGen["Bruno Code Synthesizer"]
         Chatbot["QA Chatbot"]
-        ReAct["ReAct Diagnostics (deferred)"]
+        ReAct["Failure Diagnostics Agent"]
+        Healer["Test Healer"]
     end
 
     subgraph ExecutionPlane["4. Execution & Data Plane"]
@@ -53,7 +54,7 @@ flowchart TD
 | :--- | :--- | :--- | :--- |
 | **Control** | `pydantic-graph` | Routes each CLI verb through the stage nodes; error boundaries | Volatile `PipelineGraphState`; anything durable is in Gel, MinIO or on disk, so every stage can start from persisted artifacts |
 | **Knowledge** | Gel | Specs, endpoints, requirements, analyses, test cases, runs | Specs and analyses are append-only and versioned. Test cases, runs and executions are mutable |
-| **Cognitive** | `PydanticAI` (OpenCode Go model from `.env`) | Joint analysis, test design, Bruno implementation, Q&A | Stateless agent calls; every output is validated deterministically and retried with `ModelRetry` |
+| **Cognitive** | `PydanticAI` (OpenCode Go model from `.env`) | Joint analysis, test design, Bruno implementation, failure triage, self-healing, Q&A | Stateless agent calls; every output is validated deterministically and retried with `ModelRetry` |
 | **Execution** | Bruno CLI, `asyncio.subprocess` | Runs the generated collection against the SUT | Ephemeral OS processes (own process group, timeout kill) |
 | **Observability** | MinIO, Gel, FastAPI | Raw logs and reports; dashboard and chatbot (read-only) | Two tiers: raw logs in S3, structured metadata in Gel |
 
@@ -61,6 +62,8 @@ flowchart TD
 - joint spec analysis;
 - test-case generation into Gel;
 - implementing the cases as Bruno files;
+- diagnosing failed tests;
+- healing test defects;
 - the chatbot.
 
 Deterministic code does everything else:
@@ -77,9 +80,11 @@ flowchart LR
     A["srg analyze<br/>joint analysis report<br/>(no Gel writes)"] --> P["srg plan<br/>test cases -> Gel only"]
     P --> B["srg build<br/>Gel -> LLM -> test_generated/bruno/"]
     B --> T["srg test<br/>health check, bru run<br/>results -> Gel, logs -> MinIO"]
+    T -- failures --> D["diagnose<br/>rules + diagnostics agent<br/>DiagnosticNote"]
+    D -- "TEST_DEFECT (srg test --heal)" --> H["heal<br/>repair, rebuild, verify<br/>or roll back"]
 ```
 
-`srg go` runs all four stages. `srg cases` / `srg show` review what is in Gel, `srg reset` wipes Gel and the bucket, and `srg web` starts the dashboard.
+`srg go` runs analyze → plan → build → test → diagnose. `srg diagnose` and `srg heal` work on an existing run. `srg cases` / `srg show` review what is in Gel, `srg reset` wipes Gel and the bucket, and `srg web` starts the dashboard.
 
 ---
 
@@ -210,13 +215,44 @@ erDiagram
 
 ---
 
-## 4. ReAct Diagnostics State Machine (deferred)
+## 4. ReAct Diagnostics (failure triage)
 
-When this is built, failed executions will go to a `DiagnosticsNode`:
-1. A **deterministic pre-classifier** maps connection refused, 502/503 and timeouts to `ENV_FAILURE` without an LLM call. The pre-flight health check already aborts a run early when the SUT is down.
-2. The PydanticAI agent then reads the telemetry from both tiers, through the tools `get_logs`, `get_spec_fragment`, `get_requirement`, `get_script` and `rerun_test`.
-3. It classifies each failure as one of: `APPLICATION_BUG`, `SPEC_MISMATCH`, `ENV_FAILURE`, `FLAKY` (needs a rerun policy), `TEST_DEFECT` (the generated test is wrong; the case goes back to `PENDING`), or `UNKNOWN` (when confidence is below the threshold).
-4. The result is persisted as a `DiagnosticNote`, linked exclusively to its `TestExecution`. These Gel types are added by a migration in that iteration.
+`srg test` ends in `DiagnoseNode` whenever a test failed. `srg diagnose [RUN_ID]` runs the node on its own.
+
+```mermaid
+flowchart TD
+    Fail["TestNode: failed executions"] --> Group["group by failure signature<br/>(status, HTTP, assertion, actor/endpoints)"]
+    Group --> Rule{"rule pre-classifier<br/>conn refused / DNS / timeout / 502-504?"}
+    Rule -- yes --> Env["ENV_FAILURE (RULE)"]
+    Rule -- no --> Agent["Diagnostics agent (.env model)<br/>one representative per group"]
+    Agent -->|tools| Tools["http_exchange (MinIO) · api_contract · requirements<br/>test_files · case_history · rerun_case (once)"]
+    Agent --> Cat["APPLICATION_BUG · SPEC_MISMATCH · TEST_DEFECT<br/>FLAKY · UNKNOWN (confidence < 0.5)"]
+    Env & Cat --> Save["DiagnosticNote per execution (Gel)"]
+    Cat -- TEST_DEFECT --> Review["TestCase -> NEEDS_REVIEW + suggested fix"]
+```
+
+- **Gel model:** `DiagnosticNote` holds `execution` (exclusive), `category`, `source` (`RULE`/`LLM`), `root_cause`, `evidence`, `recommended_action`, `suggested_fix`, `confidence`, `rerun_status` and `model_name`. `TestExecution.diagnosis` is a computed back-link to it.
+- **Budget:** the largest groups are investigated first, up to `--max-llm` (default 30) investigations. Reruns run one at a time, because they hit the SUT.
+
+---
+
+## 4b. Self-healing of test defects
+
+```mermaid
+flowchart TD
+    D["DiagnosticNote = TEST_DEFECT (confidence >= 0.5)"] --> H["Healer agent (.env model)<br/>case IR + diagnosis + HTTP exchange + contract + requirements"]
+    H --> G{"guard rails<br/>valid IR · same type/requirements/endpoints<br/>expected status documented · changed"}
+    G -- violations --> H
+    G --> S["replace case in Gel (same test id), HealAttempt UNVERIFIED"]
+    S --> B["rebuild Bruno files (synthesizer)"] --> V["re-run: TestRun kind=HEAL_VERIFY"]
+    V -- passed --> OK["VERIFIED: READY + tag healed"]
+    V -- failed, attempts left --> H
+    V -- failed --> RB["ROLLED_BACK: restore previous IR, NEEDS_REVIEW, rebuild"]
+```
+
+- **Scope:** only `TEST_DEFECT` failures are healed. `APPLICATION_BUG` and `SPEC_MISMATCH` stay red, because they are real findings.
+- **Audit:** `HealAttempt` stores `before_ir`/`after_ir`, the change summary and the verification run, which enables review and rollback.
+- **Verification runs** have `TestRun.kind = HEAL_VERIFY`, so `srg diagnose` and `srg heal` never pick them as their default run.
 
 ---
 
@@ -224,12 +260,12 @@ When this is built, failed executions will go to a `DiagnosticsNode`:
 
 ```mermaid
 flowchart LR
-    OAPI["OpenAPI 3.x (.yaml/.json)"] --> OParser["OpenAPI parser<br/>(deterministic, $ref resolved, digest)"]
+    OAPI["OpenAPI 3.x / Swagger 2.0 (.yaml/.json)"] --> OParser["OpenAPI parser<br/>(deterministic, $ref resolved, digest)"]
     MPRD["Markdown PRD (.md)"] --> MParser["PRD sectioning"]
     OParser --> Analyzer["Joint Spec Analyzer (one LLM call)"]
     MParser --> Analyzer
     Analyzer --> Report["modules, requirements, correlations,<br/>conflicts, gaps, risks"]
-    Report --> Planner["Test Planner (per module, parallel)"]
+    Report --> Planner["Test Planner (chunks of <= 3 endpoints, parallel)"]
     Planner --> Gel[("Gel: test cases (IR)")]
     Gel --> Synth["Bruno Code Synthesizer (per case)"]
     Synth --> Validate["validate: YAML, OpenCollection schema,<br/>names, variables, secrets, JS syntax"]
@@ -254,3 +290,20 @@ flowchart LR
 
   A manifest (`test_generated/.srg-bruno-manifest.json`) maps the files back to cases and rows.
 - **Incremental builds:** a case whose IR is unchanged (`ir_hash`) is not regenerated. `--force` regenerates it anyway.
+
+---
+
+## 6. LLM Performance & Robustness
+
+Every agent runs through `llm.run_structured()`, which applies these measures:
+
+| Measure | Why |
+| :--- | :--- |
+| **Own `x-opencode-session` per conversation** | OpenCode routes by session; parallel calls that share one session are served one after another (measured: 4 parallel calls took 9.2 s on one session and 2.8 s on separate sessions). |
+| **`SRG_THINKING=auto`** | Hidden reasoning is on for analyze, plan and diagnose, and off for the Bruno synthesizer, a mechanical translation that is validated anyway. Reasoning was ~70% of output tokens. |
+| **Prompted-output fallback** | Some reasoning models reject forced tool calls, or keep producing broken or truncated tool JSON. The call is then retried in prompted mode, and that mode is kept for the rest of the process. |
+| **Chunked planning** (`SRG_PLAN_CHUNK_SIZE=3`) | Keeps answers short, so they are not truncated. A failing chunk is reported and skipped, and the other modules are still stored. |
+| **Failure grouping** | Failures with the same signature get one diagnostics investigation (e.g. 159 × HTTP 401 → 1 call); `--max-llm` caps the investigations. |
+| **Incremental build** | A case whose IR is unchanged (`ir_hash`) is not regenerated. |
+| **Usage summary** | Every command prints the LLM calls, tokens, total call time vs wall time per agent, and the fallbacks. |
+

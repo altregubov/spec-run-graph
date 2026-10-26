@@ -142,3 +142,15 @@ def test_prompt_contains_translation_inputs(cases):
 
 def test_orders_specs_load():
     assert len(orders_specs()) == 2
+
+
+def test_uppercase_header_keys_are_rejected(cases):
+    """Found by the diagnostics agent on a real run: res.headers['X-Request-ID'] is always undefined."""
+    tc1, _ = cases
+    planned, files = render_all(tc1)
+    name = planned[0].filename
+    doc = yaml.safe_load(files[name])
+    doc["runtime"]["assertions"].append({"expression": "res.headers['X-Request-ID']", "operator": "isDefined"})
+    files[name] = yaml.safe_dump(doc)
+    errors = validate_files(tc1, MODULE, planned, files, set())[0]
+    assert any("res.headers['x-request-id']" in e for e in errors)
