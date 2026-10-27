@@ -1,8 +1,10 @@
 # Changelog
 
-## Unreleased
+## v0.3.1 — 2026-10-27
 
-Aim: generate working test cases up front, so healing is rarely needed.
+Generate working test cases up front, so healing is rarely needed. On the warehouse API a clean run without
+healing reached 118/119 cases without test defects (99%, up from 95%), with planner corrections down from 223
+to 47 and no dropped cases.
 
 ### Added
 - **Observed data** (`Observation`, `SRG_OBSERVE`): read-only GET samples of the SUT taken before planning, shown to
