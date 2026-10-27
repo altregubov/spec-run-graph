@@ -407,7 +407,7 @@ def test_non_validation_negative_step_needs_a_complete_body():
         return CaseDraft(
             title="t",
             type="negative",
-            actor="admin",
+            actor="anonymous",  # the 401 rows test missing credentials
             steps=[
                 StepIR(name="s", endpoint="POST /api/admin/users", request={"payload": payload}, expected_status=status)
             ],
@@ -468,3 +468,27 @@ def test_status_sets_compile_to_an_in_assertion_and_must_be_documented():
     assert asserts == [{"expression": "res.status", "operator": "in", "value": "[201, 400]"}]
     errors, _ = validate_files(tc, MODULE, planned, {p.filename: dump_yaml(docs[p.filename]) for p in planned}, set())
     assert not errors
+
+
+def test_missing_token_steps_become_anonymous_and_compile_without_auth():
+    def case(**step):
+        return CaseDraft(
+            title="t",
+            type="security",
+            actor="admin",
+            steps=[StepIR(name="no token", endpoint="GET /api/user/products", expected_status=401, **step)],
+        )
+
+    errors = validate_case(case(), ctx())  # the rule (backstop for un-normalized input)
+    assert any("valid token of actor 'admin'" in e for e in errors)
+    assert normalize(case()).steps[0].actor == "anonymous"  # normalize repairs it deterministically
+    assert not validate_case(normalize(case()), ctx())
+    bad_token = RequestIR(headers={"Authorization": "Bearer invalid-token"})
+    assert not validate_case(normalize(case(request=bad_token)), ctx())
+    assert normalize(case(request=bad_token)).steps[0].actor is None
+    tc = TestCaseIR.model_validate({**normalize(case(actor="anonymous")).model_dump(), "id": "TC-ORD-001"})
+    planned = plan_files(tc)
+    docs = compile_case(tc, MODULE, planned, ENDPOINTS)
+    assert "auth" not in docs[planned[0].filename]["http"]  # no credentials
+    texts = {p.filename: dump_yaml(docs[p.filename]) for p in planned}
+    assert validate_files(tc, MODULE, planned, texts, set())[0] == []

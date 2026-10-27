@@ -13,7 +13,7 @@ from pydantic_ai.exceptions import UnexpectedModelBehavior
 from pydantic_ai.models import Model
 
 from spec_run_graph.config import get_settings
-from spec_run_graph.domain.ir import TestCaseIR, http_steps, resolve_endpoint
+from spec_run_graph.domain.ir import ANONYMOUS, TestCaseIR, http_steps, resolve_endpoint
 from spec_run_graph.engines.bruno.naming import PlannedFile, var_prefix
 from spec_run_graph.engines.bruno.normalize import normalize_text
 from spec_run_graph.engines.bruno.scaffold import actor_auth, fixture_template
@@ -196,7 +196,9 @@ def build_prompt(
             "info.name": p.display_name,
             "implements": f"{'cleanup' if p.is_cleanup else 'step'} #{p.step_seq} '{step.name}'",
             "actor": step.actor or case.actor,
-            "auth": actors.get(step.actor or case.actor or ""),
+            "auth": "omit the auth block (no credentials)"
+            if (step.actor or case.actor) == ANONYMOUS
+            else actors.get(step.actor or case.actor or ""),
             "status_assertion": None
             if p.is_cleanup
             else status_assertion(expected_statuses_for(case, p.step_seq, p.param_index)),

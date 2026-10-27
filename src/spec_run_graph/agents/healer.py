@@ -48,6 +48,8 @@ Rules:
   (you may add setup steps on other endpoints, e.g. to create a dedicated user or product).
 - Expected status codes must be documented for the endpoint in the OpenAPI contract given below.
 - Never weaken a test just to make it pass: do not delete meaningful checks, prefer correcting them.
+- A step without `actor` sends the case actor's valid token. Requests without credentials use step actor
+  "anonymous"; invalid tokens use request.headers.Authorization ("Bearer invalid-token").
 - Header checks use lower-case names: response.headers.x-request-id
 - Assert only fields documented in the response schema; never invent fields such as error.field.
 - Created entities need per-run unique usernames/emails: variables {x: "qa_{{ $faker.uuid }}"} + {{ $var.x }}.

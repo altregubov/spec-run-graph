@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.3.2 — 2026-10-27
+
+### Fixed
+- Missing-token tests sent the case actor's valid token: a step without `actor` inherits the case actor, and the IR
+  had no way to say "no credentials". New reserved actor `anonymous` (compiled without an auth block);
+  `normalize` makes a non-login step that expects only 401 without its own `Authorization` header anonymous, and
+  validation rejects the pattern as a backstop.
+
 ## v0.3.1 — 2026-10-27
 
 Generate working test cases up front, so healing is rarely needed. On the warehouse API a clean run without

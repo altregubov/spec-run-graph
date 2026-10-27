@@ -31,6 +31,7 @@ SLUG_RE = re.compile(r"^[a-z0-9]+(-[a-z0-9]+)*$")
 IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 FILTER_IN_PATH = re.compile(r"\[[A-Za-z_][A-Za-z0-9_]*=")
 PARAM_TEMPLATE_RE = re.compile(r"^\{\{\s*\$param\.([A-Za-z0-9_]+)\s*\}\}$")
+ANONYMOUS = "anonymous"  # reserved actor: the request carries no credentials (missing-token tests)
 STATUS_SET_RE = re.compile(r"^\d{3}(\s*\|\s*\d{3})+$")
 NAMESPACES = {"faker", "fixture", "env", "extract", "param", "var"}
 
@@ -64,7 +65,10 @@ class StepIR(BaseModel):
     name: str
     type: Literal["http", "delay", "recipe"] = "http"
     endpoint: str | None = Field(None, description="'METHOD /openapi/path', path segments may be templates")
-    actor: str | None = Field(None, description="module actor for this step when it differs from the case actor")
+    actor: str | None = Field(
+        None,
+        description="module actor for this step when it differs from the case actor; 'anonymous' = no credentials",
+    )
     request: RequestIR = Field(default_factory=RequestIR)
     expected_status: int | str | None = Field(
         None, description="int, '401|403' (any of these, when the specs allow several), or '{{ $param.<key> }}'"
@@ -336,7 +340,7 @@ def validate_case(case: CaseDraft, ctx: ValidationContext) -> list[str]:
             errors.append("parameter row names must be unique")
     param_keys = param_keys or set()
 
-    if case.actor and case.actor not in ctx.actors:
+    if case.actor and case.actor not in ctx.actors | {ANONYMOUS}:
         errors.append(f"unknown actor {case.actor!r}; module actors: {sorted(ctx.actors)}")
     for ref in case.coverage.requirement_refs:
         if ctx.requirement_ids and ref not in ctx.requirement_ids:
@@ -377,7 +381,7 @@ def validate_case(case: CaseDraft, ctx: ValidationContext) -> list[str]:
     resolved: list[str] = []
     for idx, (step, is_cleanup) in enumerate(http_steps(case), start=1):
         where = f"{'cleanup' if is_cleanup else 'step'} {idx} ({step.name})"
-        if step.actor and step.actor not in ctx.actors:
+        if step.actor and step.actor not in ctx.actors | {ANONYMOUS}:
             errors.append(f"{where}: unknown actor {step.actor!r}; module actors: {sorted(ctx.actors)}")
         if step.type == "recipe":
             errors.append(f"{where}: recipe {step.recipe!r} is not available (use only the listed recipes)")
@@ -453,6 +457,21 @@ def validate_case(case: CaseDraft, ctx: ValidationContext) -> list[str]:
                     "API rejects an absent body with 400 before reaching the condition under test - send a complete, "
                     "valid body (e.g. wrong password -> real username/password fields)"
                 )
+        actor = step.actor or case.actor
+        sends_token = actor and actor != ANONYMOUS and actor in ctx.actors
+        overrides = any(h.lower() == "authorization" for h in step.request.headers)
+        if (
+            statuses
+            and set(statuses) == {401}
+            and sends_token
+            and not overrides
+            and "login" not in step.endpoint.lower()
+        ):
+            errors.append(
+                f"{where}: expects 401 but sends the valid token of actor {actor!r}. For a request without "
+                f"credentials set the step actor to {ANONYMOUS!r}; for a bad token set "
+                "request.headers.Authorization (e.g. 'Bearer invalid-token')"
+            )
         if creates and method in ("POST", "PUT", "PATCH") and "login" not in step.endpoint.lower():
             for field_name, var in _id_references(step.request.payload):
                 if var in looked_up and var not in created:
@@ -581,10 +600,17 @@ def step_statuses(step: StepIR, parameters: list[dict[str, Any]]) -> list[int]:
 
 
 def normalize(case: CaseDraft) -> CaseDraft:
-    """Fold expected_error sugar into assertions; fill computed coverage; number steps."""
+    """Fold expected_error sugar into assertions; fill computed coverage; number steps; make missing-token steps
+    anonymous (a step expecting only 401 without its own Authorization header cannot mean "send my valid token")."""
     data = case.model_copy(deep=True)
     for i, (step, _) in enumerate(http_steps(data), start=1):
         step.step = i
+        inherits = (step.actor or data.actor) not in (None, ANONYMOUS)
+        overrides = any(h.lower() == "authorization" for h in step.request.headers)
+        login = "login" in (step.endpoint or "").lower()
+        only_401 = set(step_statuses(step, data.parameters)) == {401}
+        if step.type == "http" and inherits and not overrides and not login and only_401:
+            step.actor = ANONYMOUS
         err = step.expected_error
         if err:
             for attr in ("code", "field", "message"):

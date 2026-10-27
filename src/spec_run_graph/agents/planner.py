@@ -85,7 +85,10 @@ Rules:
   enum/sort values, whitespace trimming or the order of ties; leave them out instead of guessing.
 - Derive computed values from the case's own data (total_price = unit price x quantity of THIS order).
 - Put teardown of created data into `cleanup` (same step format; failures there are ignored).
-- Authentication only via actors (case `actor` / step `actor`); never literal tokens.
+- Authentication only via actors (case `actor` / step `actor`); never literal tokens. A step without `actor`
+  runs as the case actor and sends its valid token. For a request WITHOUT credentials (missing token -> 401)
+  set the step actor to "anonymous"; for an invalid token set request.headers.Authorization
+  ("Bearer invalid-token").
 - {{ $env.X }} is ONLY for the declared environment variables listed in the input - never for test data.
   Ids and other values created by the system (seed product ids, user ids, order ids) are looked up at run time:
   add an earlier step (e.g. GET /api/.../products) and `extract` the value, then use {{ $extract.x }}.

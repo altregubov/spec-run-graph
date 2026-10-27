@@ -14,13 +14,13 @@ from typing import Any
 
 from spec_run_graph.domain.expr import BODY_SEGMENT, TEMPLATE_RE, parse_check, parse_literal
 from spec_run_graph.domain.faker import bruno_dynamic
-from spec_run_graph.domain.ir import REF_RE, TestCaseIR, _merged, http_steps, resolve_endpoint
+from spec_run_graph.domain.ir import ANONYMOUS, REF_RE, TestCaseIR, _merged, http_steps, resolve_endpoint
 from spec_run_graph.engines.bruno.naming import PlannedFile, var_prefix
 from spec_run_graph.engines.bruno.normalize import _encode
 from spec_run_graph.engines.bruno.scaffold import actor_auth, fixture_template
 from spec_run_graph.engines.bruno.validate import expected_statuses_for, status_assertion
 
-COMPILER_VERSION = "4"
+COMPILER_VERSION = "5"
 _SEGMENT_RE = re.compile(BODY_SEGMENT)
 _FILTER_RE = re.compile(r"^\[([A-Za-z_][A-Za-z0-9_]*)=(.+)\]$")
 
@@ -247,7 +247,8 @@ def compile_case(
             http["body"] = {"type": "json", "data": _json_body(ctx, step.request.payload, request_schema)}
         actor = step.actor or case.actor
         explicit_auth = any(h["name"].lower() == "authorization" for h in headers)
-        if actor and not explicit_auth and actor in module["actors"]:
+        # anonymous: no auth block - bru 4.3 sends no credentials then (not inherited from the folder either)
+        if actor != ANONYMOUS and actor and not explicit_auth and actor in module["actors"]:
             http["auth"] = actor_auth({**module["actors"][actor], "_actor": actor})
 
         before: list[str] = []
