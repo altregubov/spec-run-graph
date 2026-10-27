@@ -44,7 +44,9 @@ Produce:
 4. conflicts: places where the specs contradict each other (different limits, status codes, error
    codes, fields, auth rules). Quote both statements and their sources. Be precise; do not invent.
 5. gaps: requirements without endpoints, endpoints without requirements, undocumented behaviour
-   (e.g. an error described in the PRD but not declared in OpenAPI).
+   (e.g. an error described in the PRD but not declared in OpenAPI). For every entity an endpoint creates, check
+   whether the specs say what happens on a duplicate (uniqueness rule, conflict status); if not, report a gap
+   naming the endpoint and the identifying fields (e.g. product manufacturer + model).
 6. risks: short bullet points on what is most likely to break.
 Only use endpoint keys that appear in the input."""
 

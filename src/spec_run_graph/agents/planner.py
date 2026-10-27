@@ -56,6 +56,11 @@ Rules:
   {"name": "Dedicated buyer", "type": "recipe", "recipe": "<name>", "inputs": {...}, "alias": "buyer"}
   Its outputs become {{ $extract.<alias>_<output> }} (or {{ $extract.<output> }} without alias) and its cleanup is
   added automatically. Otherwise setup actions are ordinary steps.
+- A recipe creates its entities with its input values and with the values listed under its "fixed" (e.g.
+  balance 5000, empty allowed_categories): a case can change only the inputs. Base expected values on them
+  (or on values extracted from the recipe's responses), never on the case's own assumptions. If the scenario
+  needs a different value for a fixed field (balance 100, stock 2, a non-empty whitelist), write that setup
+  step yourself instead of using the recipe.
 - Entities created by a test need per-run unique values for unique fields (username, email): define
   variables: {new_username: "qa_{{ $faker.uuid }}"} and use {{ $var.new_username }} - deletes may be soft,
   so a fixed name already exists on the next run.
@@ -82,7 +87,8 @@ Rules:
   ("401 or 403", "rejected with 400 or 422"), set expected_status to all of them, e.g. "401|403" (each must be
   documented for the endpoint). Otherwise use the single documented status.
 - Test only behaviour the specifications define. Do not assert undefined details such as case sensitivity of
-  enum/sort values, whitespace trimming or the order of ties; leave them out instead of guessing.
+  enum/sort values, whitespace trimming or the order of ties; leave them out instead of guessing. (Duplicate
+  creation is not such a detail - see the creation scenarios below.)
 - Derive computed values from the case's own data (total_price = unit price x quantity of THIS order).
 - Put teardown of created data into `cleanup` (same step format; failures there are ignored).
 - Authentication only via actors (case `actor` / step `actor`); never literal tokens. A step without `actor`
@@ -94,6 +100,27 @@ Rules:
   add an earlier step (e.g. GET /api/.../products) and `extract` the value, then use {{ $extract.x }}.
 - Cover every requirement of the module with positive, negative/boundary, security (missing or invalid
   token -> 401) and, where several actors exist, rbac cases. Prefer few precise cases over many vague ones.
+- Creation scenarios: for every endpoint that creates an entity, first decide from the specs what identifies
+  that entity in the business domain (a username for an account, an SKU or a manufacturer + model for a product,
+  an order number ...) and cover:
+  1. create, then read it back (GET by id or a list filter on the unique value) and compare the stored values
+     with the sent ones;
+  2. DUPLICATE creation: send the same create request twice with the same identifying values (one variable,
+     used in both steps). If the specs name a uniqueness rule or document a conflict response (e.g. 409 with an
+     error code), expect it on the second request and check that only one entity with that value exists. If the
+     specs define no rule for this entity, expect what the contract documents for the second request (usually
+     success with a DIFFERENT id), check that both entities exist, and tag the case "spec-gap" with an
+     expected_results line saying that duplicate handling is undefined - the run then reveals whether the API
+     silently accepts duplicates or rejects them with an undocumented status;
+     To prove that each entity exists, extract both ids and look each one up by its own id (GET by id, or a
+     list filter data[id={{ $extract.second_id }}].id exists): a filter on the shared identifying value
+     finds only the first match and proves nothing about the second;
+  3. variants of the identifying value only where the specs define normalisation (case, whitespace).
+- Every case tests an endpoint listed under "Endpoints of this module"; endpoints listed only as "Other
+  endpoints" are setup and verification steps, never the subject (their scenarios, e.g. the creation
+  scenarios of a create endpoint, are planned together with that endpoint).
+- Every case tests a distinct behaviour: never return two cases - or a case like an "already covered" one -
+  that send the same kind of requests and check the same outcome with only different data or wording.
 - Where specifications conflict, follow the OpenAPI contract for expected values, add the tag
   "spec-conflict" and explain the conflict in expected_results.
 - "Observed data" shows real responses of the API (read-only samples taken before planning). Use it to pick

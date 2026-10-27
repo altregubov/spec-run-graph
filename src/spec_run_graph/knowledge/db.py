@@ -45,7 +45,9 @@ BRUNO_ENGINE = {
 
 def create_client(settings: Settings | None = None) -> gel.AsyncIOClient:
     settings = settings or get_settings()
-    return gel.create_async_client(dsn=settings.gel_dsn, tls_security=settings.gel_tls_security)
+    client = gel.create_async_client(dsn=settings.gel_dsn, tls_security=settings.gel_tls_security)
+    # stages update many cases concurrently; Gel's default 3 attempts are too few for serialization conflicts
+    return client.with_retry_options(gel.RetryOptions(attempts=10))
 
 
 def to_json(value: Any) -> str | None:

@@ -44,7 +44,32 @@ def recipe_brief(r: RecipeIR) -> dict[str, Any]:
         "inputs": {k: {"description": v.description, "default": v.default} for k, v in r.inputs.items()},
         "outputs": r.outputs,
         "creates": [s.endpoint for s in r.steps if s.endpoint],
+        "fixed": fixed_values(r),
     }
+
+
+def fixed_values(r: RecipeIR) -> dict[str, Any]:
+    """Literal payload values per step ("POST /api/users": {"balance": 5000}): the recipe always sends them,
+    a case cannot change them (only inputs vary) - the planner must know them to assert the right values."""
+    out: dict[str, Any] = {}
+    for s in r.steps:
+        payload = s.request.payload
+        if not s.endpoint or not isinstance(payload, dict):
+            continue
+        fixed = {k: v for k, v in payload.items() if not any("{{" in t for t in _texts(v))}
+        if fixed:
+            out[s.endpoint] = fixed
+    return out
+
+
+def _texts(obj: Any) -> list[str]:
+    if isinstance(obj, str):
+        return [obj]
+    if isinstance(obj, dict):
+        return [t for v in obj.values() for t in _texts(v)]
+    if isinstance(obj, list):
+        return [t for v in obj for t in _texts(v)]
+    return []
 
 
 def _substitute(obj: Any, inputs: dict[str, Any], rename: dict[str, dict[str, str]]) -> Any:

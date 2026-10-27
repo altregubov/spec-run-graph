@@ -1,5 +1,33 @@
 # Changelog
 
+## v0.3.3 — 2026-10-27
+
+Duplicate-creation scenarios and fixes from two clean runs. Clean run without healing on the warehouse API:
+113/117 cases without test defects (97%); the remaining admin-token defects are now caught by validation.
+
+### Fixed
+- Cases asserted values their setup recipe never sends (balance 100 while the recipe creates 5000, stock 2 vs 15,
+  a whitelist the recipe leaves empty): the recipe brief now lists each recipe's `fixed` payload values, the planner
+  bases expectations on them or writes its own setup, and the recipe designer exposes every business value
+  (balances, prices, stock, restrictions) as an input.
+- `srg build` crashed with a Gel `TransactionSerializationError` when many cases were recorded concurrently: the
+  client now retries conflicts up to 10 times (Gel default: 3).
+- After an interrupted build, `srg test` reported "files missing" for cases whose files existed: the manifest was
+  only written at the end and later builds added only regenerated cases. Unchanged cases now re-register their files.
+- New validation rule: a step asserting `response.body.data.<field> == <number>` while its own request sends a
+  different number for that field is rejected (copy/paste expectations).
+- New validation rule: in a case run as a login actor (e.g. admin, logging in via /api/admin), a success step that
+  sends that actor's token to another channel (/api/user/...) while other steps of the case on that channel send an
+  explicit token is rejected (forgotten Authorization header -> 403).
+
+### Changed
+- Planner prompt: creation scenarios for every endpoint that creates an entity - read-back of the stored values and
+  duplicate creation (the documented conflict status when the specs define uniqueness; otherwise the documented
+  outcome, tagged `spec-gap`, so the run reveals whether the API silently accepts duplicates).
+- Planner prompt: each created entity is checked by its own id (a filter on the shared identifying value only finds
+  the first match); a chunk plans cases only for its own endpoints and never returns near-duplicate cases.
+- Analyzer prompt: reports a gap for every created entity whose duplicate handling the specs leave undefined.
+
 ## v0.3.2 — 2026-10-27
 
 ### Fixed

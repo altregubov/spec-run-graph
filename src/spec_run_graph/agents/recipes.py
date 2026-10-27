@@ -33,6 +33,10 @@ Example: if customers can only see or buy products matching their allowed catego
 purchasable_product_for_customer recipe creates a product (stock, price, category, manufacturer), creates a
 customer whose balance covers it and whose filters allow it, logs in as that customer, and outputs
 product_id, unit price, user_id and token. Inputs let tests vary the important values (stock, price, balance).
+Every business value a test may depend on - amounts, balances, prices, quantities, stock, restrictions such as
+allowed categories/manufacturers, statuses - must be an input with a default, never a literal in the payload: a
+test that needs balance 100 or stock 2 can only pass it through an input. Literals are only for constant
+technical values (role, flags that every caller needs the same).
 Use the observed data to pick values that exist in this API (category/manufacturer names and their casing).
 
 Recipe fields: name (snake_case), description (what it sets up, what each output holds),

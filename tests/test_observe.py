@@ -93,3 +93,50 @@ def test_modules_get_the_actors_their_recipes_need():
     changed = add_recipe_actors([staff, shop], {"buyer": recipe})
     assert changed == [shop] and [a.name for a in shop.actors] == ["user_a", "admin"]
     assert add_recipe_actors([staff, shop], {"buyer": recipe}) == []
+
+
+def test_recipe_brief_shows_the_values_a_case_cannot_change():
+    from spec_run_graph.domain.ir import StepIR
+    from spec_run_graph.domain.recipes import RecipeIR, recipe_brief
+
+    step = StepIR(
+        name="create",
+        endpoint="POST /api/admin/users",
+        request={"payload": {"username": "{{ $var.u }}", "balance": 5000.0, "price": "{{ $input.price }}"}},
+    )
+    brief = recipe_brief(RecipeIR(name="buyer", description="d", steps=[step], outputs={}))
+    assert brief["fixed"] == {"POST /api/admin/users": {"balance": 5000.0}}
+
+
+def test_assertion_contradicting_the_sent_value_is_rejected():
+    from spec_run_graph.domain.ir import CaseDraft, StepIR, _contradicting_echoes
+
+    step = StepIR(
+        name="order",
+        endpoint="POST /api/user/orders",
+        request={"payload": {"product_id": 1, "quantity": 2}},
+        expected_status=201,
+        assertions=[{"check": "response.body.data.quantity == 1"}, {"check": "response.body.data.product_id == 1"}],
+    )
+    CaseDraft(title="t", type="positive", steps=[step])
+    assert _contradicting_echoes(step) == [("quantity", 2, 1)]
+
+
+def test_step_falling_back_to_the_case_token_beside_explicit_tokens_is_rejected():
+    from spec_run_graph.domain.ir import CaseDraft, StepIR, _inherited_token_errors
+
+    buyer = {"headers": {"Authorization": "Bearer {{ $extract.token }}"}}
+    case = CaseDraft(
+        title="t",
+        type="positive",
+        actor="admin",
+        steps=[
+            StepIR(name="cancel", endpoint="PATCH /api/admin/orders/1/status", expected_status=200),
+            StepIR(name="profile", endpoint="GET /api/user/profile", request=buyer, expected_status=200),
+            StepIR(name="catalog", endpoint="GET /api/user/products?category=x", expected_status=200),
+        ],
+    )
+    errors = _inherited_token_errors(case, {"admin": "/api/admin", "user_a": "/api/user"})
+    assert len(errors) == 1 and errors[0].startswith("step 3 (catalog)")
+    customer = case.model_copy(update={"actor": "user_a"})  # a customer reading its own catalog is fine
+    assert _inherited_token_errors(customer, {"admin": "/api/admin", "user_a": "/api/user"}) == []

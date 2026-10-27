@@ -30,6 +30,7 @@ from spec_run_graph.domain.ir import (
     CaseDraft,
     TestCaseIR,
     ValidationContext,
+    actor_channels,
     declared_env_vars,
     fingerprint,
     http_steps,
@@ -293,6 +294,7 @@ async def recipes_stage(
         response_schemas={k: e.response_schemas for k, e in endpoints.items()},
         request_schemas={k: e.request_schema for k, e in endpoints.items()},
         page_limits=page_limits(endpoints),
+        actor_channels=actor_channels(module["actors"]),
     )
     schemas = {k: {"request_schema": e.request_schema, "responses": e.response_schemas} for k, e in endpoints.items()}
     reachable = await health_check(deps.settings.sut_base_url) is None
@@ -435,6 +437,7 @@ async def plan_stage(
             response_schemas={k: e.response_schemas for k, e in endpoints.items()},
             request_schemas={k: e.request_schema for k, e in endpoints.items()},
             page_limits=page_limits(endpoints),
+            actor_channels=actor_channels(m.actors),
         )
         shown = [{k: v for k, v in e.items() if k != "fingerprint"} for e in existing]
         chunks = [m.endpoints[i : i + chunk_size] for i in range(0, len(m.endpoints), chunk_size)] or [[]]
@@ -564,9 +567,22 @@ async def build_stage(
         module = modules[row.test_module.code]
         folder = root / module["folder"]
         planned = plan_files(case)
+
+        def add_to_manifest(folder_name: str) -> None:
+            for p in planned:
+                manifest[f"{folder_name}/{p.filename}"] = {
+                    "test_id": p.test_id,
+                    "param_index": p.param_index,
+                    "step_seq": p.step_seq,
+                    "file_step": p.file_step,
+                    "is_cleanup": p.is_cleanup,
+                }
+
         ihash = ir_hash(case, {"module": module, "model": model, "compiler": compiler.COMPILER_VERSION})
         files_exist = all((folder / p.filename).exists() for p in planned)
         if not force and row.ir_hash == ihash and str(row.gen_status) == "GENERATED" and files_exist:
+            if not dry_run:  # an interrupted build may have lost the manifest entries of files it already wrote
+                add_to_manifest(module["folder"])
             existing = {p.filename: (folder / p.filename).read_text() for p in planned}
             fixed = {name: normalize_text(text) for name, text in existing.items()}
             normalized = {name: text for name, (text, _) in fixed.items()}
@@ -648,13 +664,7 @@ async def build_stage(
             doc = parsed[p.filename]
             (folder / p.filename).write_text(scaffold.dump_yaml(doc))
             docs.append(doc)
-            manifest[f"{module['folder']}/{p.filename}"] = {
-                "test_id": p.test_id,
-                "param_index": p.param_index,
-                "step_seq": p.step_seq,
-                "file_step": p.file_step,
-                "is_cleanup": p.is_cleanup,
-            }
+        add_to_manifest(module["folder"])
         await repo.record_generation(
             client,
             case.id,
@@ -1138,6 +1148,7 @@ async def lint_findings(deps: GraphDependencies, flt: CaseFilter) -> dict[str, A
             response_schemas={k: e.response_schemas for k, e in drafts.items()},
             request_schemas={k: e.request_schema for k, e in drafts.items()},
             page_limits=page_limits(drafts),
+            actor_channels=actor_channels(m["actors"]),
         )
         errors = validate_case(repo.row_to_ir(row), ctx)
         if errors:
@@ -1227,6 +1238,7 @@ async def heal_stage(
             env_vars=declared_env_vars(
                 {n: a for n, a in module["actors"].items() if a.get("type") != "login"}, module["fixtures"]
             ),
+            actor_channels=actor_channels(module["actors"]),
         )
         endpoints = sorted(e.key for e in row.endpoints)
         st["endpoints"] = endpoints

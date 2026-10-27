@@ -183,6 +183,7 @@ class ValidationContext:
     response_schemas: dict[str, dict[str, Any]] | None = None
     request_schemas: dict[str, Any] | None = None  # endpoint key -> request body JSON schema
     page_limits: dict[str, tuple[str, int]] | None = None  # paginated endpoint -> (page-size param, maximum)
+    actor_channels: dict[str, str] = field(default_factory=dict)  # login actor -> path channel of its login endpoint
 
 
 def missing_required(schema: Any, payload: Any, where: str = "payload") -> list[str]:
@@ -488,6 +489,12 @@ def validate_case(case: CaseDraft, ctx: ValidationContext) -> list[str]:
                     "already exist from an earlier run (deletes can be soft). Use a per-run unique value, e.g. "
                     "variables: {name: 'qa_{{ $faker.uuid }}'} and {{ $var.name }}"
                 )
+        if creates and method in ("POST", "PUT", "PATCH") and isinstance(step.request.payload, dict):
+            for field_name, sent, expected in _contradicting_echoes(step):
+                errors.append(
+                    f"{where}: asserts response.body.data.{field_name} == {expected} but the same request sends "
+                    f"{field_name}={sent}; expect the value the step sends"
+                )
         if ctx.response_schemas is not None and key and key in ctx.response_schemas:
             statuses = [str(s) for s in step_statuses(step, case.parameters)]
             schemas = [(ctx.response_schemas[key].get(s) or {}).get("schema") for s in statuses]
@@ -535,7 +542,53 @@ def validate_case(case: CaseDraft, ctx: ValidationContext) -> list[str]:
         rk = resolve_endpoint(e, ctx.endpoint_paths)
         if rk is None or rk not in resolved:
             errors.append(f"coverage endpoint {e!r} is not exercised by any step")
+    errors += _inherited_token_errors(case, ctx.actor_channels)
     return errors
+
+
+def _channel(endpoint: str) -> str:
+    """'GET /api/user/products?x=1' -> '/api/user' (the first two literal path segments)."""
+    path = endpoint.split(None, 1)[-1].split("?")[0]
+    return "/" + "/".join([s for s in path.split("/") if s and "{" not in s][:2])
+
+
+def actor_channels(actors: Any) -> dict[str, str]:
+    """Login actors -> channel of their login endpoint ('/api/admin'). Accepts ActorDefs or {name: auth dict}."""
+    pairs = actors.items() if isinstance(actors, dict) else ((a.name, a.auth.model_dump()) for a in actors)
+    return {
+        name: _channel(auth["login_endpoint"])
+        for name, auth in pairs
+        if auth.get("type") == "login" and auth.get("login_endpoint")
+    }
+
+
+def _inherited_token_errors(case: CaseDraft, channels: dict[str, str]) -> list[str]:
+    """A success step that sends the case actor's token to another channel than the one the actor logs in to
+    (admin -> /api/user/...), while other success steps of the case on that channel authenticate with an explicit
+    token: a forgotten header (e.g. an admin case checking the customer catalog -> 403)."""
+    home = channels.get(case.actor or "")
+    if not home:
+        return []
+    explicit: dict[str, set[str]] = {}
+    inherit: list[tuple[int, StepIR]] = []
+    for i, (step, is_cleanup) in enumerate(http_steps(case), start=1):
+        if is_cleanup or step.type != "http" or not step.endpoint or "login" in step.endpoint.lower():
+            continue
+        if not any(200 <= s < 300 for s in step_statuses(step, case.parameters)):
+            continue
+        auth = next((v for h, v in step.request.headers.items() if h.lower() == "authorization"), None)
+        if auth:
+            explicit.setdefault(_channel(step.endpoint), set()).add(str(auth))
+        elif not step.actor and _channel(step.endpoint) != home:
+            inherit.append((i, step))
+    return [
+        f"step {i} ({step.name}): sends the token of the case actor {case.actor!r} (who logs in via {home}) to "
+        f"{step.endpoint.split('?')[0]}, while the other {_channel(step.endpoint)} steps of this case authenticate "
+        f"with {' / '.join(sorted(explicit[_channel(step.endpoint)]))}; send that Authorization header (or set the "
+        "step actor)"
+        for i, step in inherit
+        if _channel(step.endpoint) in explicit
+    ]
 
 
 def creates_or_cleanup(step: StepIR, is_cleanup: bool, parameters: list[dict[str, Any]]) -> bool:
@@ -562,6 +615,24 @@ def _id_references(payload: Any) -> list[tuple[str, str]]:
         for v in payload:
             found.extend(_id_references(v))
     return found
+
+
+def _contradicting_echoes(step: StepIR) -> list[tuple[str, Any, Any]]:
+    """(field, sent, asserted) where a step asserts response.body.data.<field> == <number> while its own payload
+    sends a different number for that field (a copy/paste expectation: the created entity echoes what was sent)."""
+    payload = step.request.payload
+    out = []
+    for a in step.assertions:
+        with contextlib.suppress(CheckSyntaxError):
+            chk = parse_check(a.check)
+            m = re.fullmatch(r"response\.body\.data\.([A-Za-z_][A-Za-z0-9_]*)", chk.path)
+            if chk.op != "==" or chk.is_template or not m or m.group(1) not in payload:
+                continue
+            sent = payload[m.group(1)]
+            numbers = all(isinstance(v, int | float) and not isinstance(v, bool) for v in (sent, chk.value))
+            if numbers and float(sent) != float(chk.value):
+                out.append((m.group(1), sent, chk.value))
+    return out
 
 
 def _unique_literals(payload: Any) -> list[tuple[str, str]]:
