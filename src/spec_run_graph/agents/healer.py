@@ -26,10 +26,12 @@ from spec_run_graph.domain.ir import (
     ValidationContext,
     covered_endpoints,
     http_steps,
+    missing_required,
     normalize,
     resolve_endpoint,
     validate_case,
 )
+from spec_run_graph.domain.recipes import RecipeIR, expand_recipes, recipe_brief
 from spec_run_graph.llm import build_model, output_spec, run_structured
 
 INSTRUCTIONS = """\
@@ -41,11 +43,23 @@ Return the COMPLETE corrected test case in the same format (title, type, priorit
 preconditions, variables, parameters, steps, expected_results, cleanup) plus a short change_summary.
 Rules:
 - Fix the root cause described by the diagnosis; keep everything else unchanged.
-- Keep testing the same behaviour: same case type, same requirement_refs, same endpoints.
+- Keep testing the same behaviour: same case type, same requirement_refs, every original endpoint
+  (you may add setup steps on other endpoints, e.g. to create a dedicated user or product).
 - Expected status codes must be documented for the endpoint in the OpenAPI contract given below.
 - Never weaken a test just to make it pass: do not delete meaningful checks, prefer correcting them.
 - Header checks use lower-case names: response.headers.x-request-id
-- Check grammar: "<path> <op> <literal>", paths response.status | response.headers.<h> | response.body.<path>.
+- Assert only fields documented in the response schema; never invent fields such as error.field.
+- Created entities need per-run unique usernames/emails: variables {x: "qa_{{ $faker.uuid }}"} + {{ $var.x }}.
+- Ids of seeded data are never env variables: look them up in an earlier step (GET the list, extract).
+- Balance/stock-dependent flows: create a dedicated user with a known balance (admin API), log in as it,
+  extract the token and use header Authorization: Bearer {{ $extract.token }} - shared seed accounts get drained.
+- Assert/extract only the paths listed as "assertable (guaranteed) fields" (optional ones such as requestId,
+  error.details or pagination may be omitted by the API); `not exists` checks are fine.
+- Requests expected to succeed must send every field listed under "a successful request MUST send".
+- Never assume a pristine database (balances, stock, counts, list order change during the suite): extract a
+  baseline first and compare relative to it; select list items by attribute: response.body.data[model='X'].id.
+- Check grammar: "<path> <op> <literal>", paths response.status | response.headers.<h> | response.body.<path>,
+  list filters allowed: response.body.data[model='X'].id.
 - Templates allowed: {{ $faker.x }} {{ $fixture.x }} {{ $env.X }} {{ $extract.x }} {{ $param.x }} {{ $var.x }}.
 If the evidence shows the API (not the test) is wrong after all, do not change the case: set
 unhealable_reason and return the case unchanged."""
@@ -64,6 +78,7 @@ class HealDeps:
     original: CaseDraft
     ctx: ValidationContext
     documented_statuses: dict[str, set[int]]  # endpoint key -> documented response codes
+    recipes: dict[str, RecipeIR] = field(default_factory=dict)
     last_errors: list[str] = field(default_factory=list)
     attempts: int = 0
 
@@ -81,6 +96,22 @@ def _expected_statuses(case: CaseDraft, step_index: int) -> list[int]:
     return []
 
 
+def _required_field_negatives(case: CaseDraft, ctx: ValidationContext) -> set[tuple[str, frozenset[str]]]:
+    """(endpoint, omitted required fields) of steps that expect a 4xx for a request missing required fields."""
+    out = set()
+    for i, (step, is_cleanup) in enumerate(http_steps(case)):
+        if is_cleanup or step.type != "http" or not step.endpoint or not ctx.request_schemas:
+            continue
+        key = resolve_endpoint(step.endpoint, ctx.endpoint_paths)
+        schema = ctx.request_schemas.get(key or "")
+        statuses = _expected_statuses(case, i)
+        if schema and statuses and all(400 <= s < 500 for s in statuses):
+            missing = missing_required(schema, step.request.payload)
+            if missing:
+                out.add((key, frozenset(missing)))
+    return out
+
+
 def guard_errors(healed: CaseDraft, deps: HealDeps) -> list[str]:
     errors = validate_case(healed, deps.ctx)
     orig = deps.original
@@ -90,8 +121,14 @@ def guard_errors(healed: CaseDraft, deps: HealDeps) -> list[str]:
         errors.append(f"keep requirement_refs {sorted(orig.coverage.requirement_refs)}")
     before = set(covered_endpoints(orig, deps.ctx.endpoint_paths))
     after = set(covered_endpoints(healed, deps.ctx.endpoint_paths))
-    if before != after:
-        errors.append(f"keep testing the same endpoints {sorted(before)} (got {sorted(after)})")
+    if not before <= after:  # setup steps may add endpoints (e.g. create a dedicated user); nothing may be dropped
+        errors.append(f"keep testing all original endpoints; missing {sorted(before - after)}")
+    kept = _required_field_negatives(healed, deps.ctx)
+    for key, missing in sorted(_required_field_negatives(orig, deps.ctx) - kept):
+        errors.append(
+            f"keep the negative step that sends {key} without the contract-required {sorted(missing)} and expects "
+            "a 4xx: if the API accepts it, that is an application bug the test must keep detecting"
+        )
     for i, (step, is_cleanup) in enumerate(http_steps(healed)):
         if is_cleanup or step.type != "http" or not step.endpoint:
             continue
@@ -124,7 +161,11 @@ def build_agent(output: Any = None) -> Agent[HealDeps, HealedCase]:
         ctx.deps.attempts += 1
         if out.unhealable_reason:
             return out
-        healed = normalize(out.case)
+        expanded, errors = expand_recipes(out.case, ctx.deps.recipes)
+        if errors:
+            ctx.deps.last_errors = errors
+            raise ModelRetry("The healed case is not acceptable. Fix these problems:\n- " + "\n- ".join(errors))
+        healed = normalize(expanded)
         errors = guard_errors(healed, ctx.deps)
         ctx.deps.last_errors = errors
         if errors:
@@ -138,18 +179,27 @@ def build_prompt(
     case: CaseDraft,
     diagnoses: list[dict[str, Any]],
     exchange: str,
-    contracts: dict[str, Any],
+    contracts: str,
     requirements: list[dict[str, Any]],
     previous_attempt: str | None = None,
+    recipes: dict[str, RecipeIR] | None = None,
+    lessons: list[str] | None = None,
 ) -> str:
     parts = [
         "Test case to repair (IR):\n"
         + yaml.safe_dump(case.model_dump(mode="json", exclude_defaults=True), sort_keys=False, allow_unicode=True),
         "Diagnosis of the failing rows:\n" + json.dumps(diagnoses, default=str)[:6000],
         "Recorded HTTP exchange of the failing run:\n" + exchange[:10000],
-        "OpenAPI contract of the endpoints:\n" + json.dumps(contracts, default=str)[:10000],
+        "OpenAPI contracts (the case's endpoints first, then the others usable as setup steps):\n" + contracts,
         "Requirements:\n" + json.dumps(requirements, default=str)[:4000],
     ]
+    if recipes:
+        parts.append(
+            "Setup recipes (verified; a step {type: recipe, recipe, inputs, alias} expands into their steps):\n"
+            + json.dumps([recipe_brief(r) for r in recipes.values()])
+        )
+    if lessons:
+        parts.append("Lessons learned from earlier test defects:\n- " + "\n- ".join(lessons))
     if previous_attempt:
         parts.append("Your previous fix was applied but the test still failed:\n" + previous_attempt[:3000])
     return "\n\n".join(parts)

@@ -11,7 +11,13 @@ from spec_run_graph.specs.diff import SpecChanges
 
 
 class AuthDef(BaseModel):
-    type: Literal["bearer", "basic", "apikey", "none"] = "bearer"
+    type: Literal["login", "bearer", "basic", "apikey", "none"] = "bearer"
+    # type=login: the collection logs in once per run and sends the returned token as a bearer token
+    login_endpoint: str | None = Field(None, description="login endpoint key, e.g. 'POST /api/admin/login'")
+    login_body: dict[str, Any] | None = Field(
+        None, description="login request body with the test-account credentials documented in the spec"
+    )
+    token_path: str | None = Field(None, description="dot path of the token in the login response, e.g. data.token")
     token: str | None = Field(None, description="bearer token, as '{{ $env.VAR }}' - never a literal secret")
     username: str | None = None
     password: str | None = Field(None, description="as '{{ $env.VAR }}'")

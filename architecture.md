@@ -291,6 +291,20 @@ flowchart LR
   A manifest (`test_generated/.srg-bruno-manifest.json`) maps the files back to cases and rows.
 - **Incremental builds:** a case whose IR is unchanged (`ir_hash`) is not regenerated. `--force` regenerates it anyway.
 
+### 5b. Keeping generated cases correct
+
+- **Contract facts** (`specs/contract.py`, stored on `ApiEndpoint`): required request fields and guaranteed
+  response paths. The same facts drive the prompts and the IR validation, so the LLM is told exactly what code
+  checks afterwards.
+- **Setup recipes** (`SetupRecipe`): designed once per analysis, compiled and run once against the SUT; only
+  `VERIFIED` recipes are offered. `domain/recipes.expand_recipes` turns a `type: recipe` step into ordinary steps
+  (renamed variables/extracts, outputs as `$extract.<alias>_<output>`, cleanup prepended) before validation, so
+  Gel, the compiler and the healer only see plain steps.
+- **Compiler first:** `srg build` compiles the IR to Bruno deterministically and self-checks the result with the
+  same validator as LLM output; the synthesizer runs only for unsupported features (e.g. `poll`).
+- **Lessons** (`Lesson`): after verified heals, an LLM pass generalises the fixes; lessons that contradict the
+  contract are rejected. They are injected into planner and healer prompts.
+
 ---
 
 ## 6. LLM Performance & Robustness

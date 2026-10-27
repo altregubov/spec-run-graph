@@ -14,6 +14,8 @@ SCHEMA_FILE = Path(__file__).resolve().parents[3] / "dbschema" / "default.gel"
 
 # Delete order respects links (children first).
 WIPE_ORDER = [
+    "Lesson",
+    "SetupRecipe",
     "HealAttempt",
     "DiagnosticNote",
     "TestExecution",

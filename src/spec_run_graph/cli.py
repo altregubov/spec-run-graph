@@ -20,7 +20,7 @@ from spec_run_graph.deps import GraphDependencies
 from spec_run_graph.knowledge import db, repo
 from spec_run_graph.knowledge.repo import CaseFilter
 from spec_run_graph.llm import USAGE
-from spec_run_graph.pipeline.graph import PipelineGraphState, run_pipeline
+from spec_run_graph.pipeline.graph import ORDER, PipelineGraphState, run_pipeline
 
 app = typer.Typer(help="SpecRunGraph: spec-driven API tests (OpenAPI + PRD -> Gel -> Bruno).", no_args_is_help=True)
 console = Console()
@@ -38,9 +38,33 @@ def run_async(fn):
     return wrapper
 
 
+async def check_services(deps: GraphDependencies, need_s3: bool) -> list[str]:
+    """Fail fast (before any LLM call) when Gel / MinIO are not reachable."""
+    problems = []
+    try:
+        await asyncio.wait_for(deps.client.query_single("select 1"), 10)
+    except Exception as exc:  # noqa: BLE001
+        problems.append(f"Gel ({deps.settings.gel_dsn}) is not reachable: {exc.__class__.__name__}")
+    if need_s3:
+        try:
+            await asyncio.wait_for(deps.store.ensure_bucket(), 10)
+        except Exception as exc:  # noqa: BLE001
+            problems.append(f"MinIO ({deps.settings.s3_endpoint_url}) is not reachable: {exc.__class__.__name__}")
+    return problems
+
+
 async def _pipeline(state: PipelineGraphState) -> PipelineGraphState:
     deps = GraphDependencies(console=console)
     started = time.monotonic()
+    if not (state.start == "analyze" and state.stop == "analyze"):  # analyze alone works without Gel
+        need_s3 = ORDER.index(state.stop) >= ORDER.index("test")
+        problems = await check_services(deps, need_s3)
+        if problems:
+            await deps.aclose()
+            for p in problems:
+                console.print(f"[red]{p}[/]")
+            console.print("Start the services with [bold]docker compose up -d[/] and check with [bold]srg doctor[/].")
+            raise typer.Exit(2)
     try:
         return await run_pipeline(state, deps)
     finally:
@@ -115,6 +139,15 @@ def print_plan(state: PipelineGraphState) -> None:
     p = state.plan
     if p is None:
         return
+    if p.refreshed:
+        console.rule("[bold]Gel refreshed")
+        console.print(f"  modules, actors and fixtures updated: {', '.join(p.refreshed)} (no new test cases)")
+        console.print("  Next: [bold]srg build[/] regenerates the Bruno files for the changed modules.")
+        return
+    if p.recipes:
+        console.rule("[bold]Setup recipes")
+        for name, status in sorted(p.recipes.items()):
+            console.print(f"  {name}: {status}")
     console.rule("[bold]Test cases stored in Gel")
     for code, ids in p.created.items():
         console.print(f"  {code}: {len(ids)} new  {', '.join(ids)}")
@@ -140,6 +173,9 @@ def print_build(state: PipelineGraphState) -> None:
     console.rule("[bold]Bruno build")
     console.print(
         f"  generated: {len(b.generated)}  unchanged (skipped): {len(b.skipped_unchanged)}  failed: {len(b.failed)}"
+        + (f"  (regenerated after rule changes: {len(b.revalidated)})" if b.revalidated else "")
+        + (f"  (repaired without LLM: {len(b.normalized)})" if b.normalized else "")
+        + (f"  (compiled without LLM: {len(b.compiled)}/{len(b.generated)})" if b.generated else "")
     )
     for tid, errs in b.failed:
         console.print(f"  [red]FAILED_GEN {tid}[/]: " + " | ".join(errs[:3]))
@@ -223,7 +259,11 @@ def print_diagnosis(state: PipelineGraphState, show_empty: bool = False) -> None
         console.print("  TEST_DEFECT cases were set to NEEDS_REVIEW: fix them, then [bold]srg show <id> --approve[/].")
     for tid, pidx, err in d.errors:
         console.print(f"  [red]diagnosis failed[/] {tid}{chr(ord('a') + pidx)}: {err}")
-    console.print(f"  [dim]{len(d.rows)} failures in {d.groups} groups; {d.llm_investigations} LLM investigations[/]")
+    total = len(d.rows) + d.not_diagnosed + len(d.errors)
+    console.print(
+        f"  [dim]{len(d.rows)}/{total} failures diagnosed ({d.groups} groups, "
+        f"{d.llm_investigations} LLM investigations)[/]"
+    )
     if d.not_diagnosed:
         console.print(f"  [yellow]{d.not_diagnosed} failures not diagnosed (over --max-llm); re-run srg diagnose[/]")
     if d.skipped_existing:
@@ -266,6 +306,8 @@ def print_healing(state: PipelineGraphState, show_empty: bool = False) -> None:
         console.print(f"  [dim]verification runs: {', '.join(h.verify_run_ids)}[/]")
     if counts.get("ROLLED_BACK") or counts.get("FAILED"):
         console.print("  Rolled-back cases are NEEDS_REVIEW with the reason; see [bold]srg show <id>[/].")
+    for text in h.lessons:
+        console.print(f"  [cyan]lesson[/]: {text}")
 
 
 # ---------------------------------------------------------------- commands
@@ -328,12 +370,20 @@ async def plan(
     specs: SpecsArg = None,
     from_: Annotated[Path | None, typer.Option("--from", help="reuse a reviewed analysis report (.json)")] = None,
     replace: Annotated[bool, typer.Option(help="deprecate existing cases and plan from scratch")] = False,
+    refresh_only: Annotated[
+        bool, typer.Option(help="only update specs, modules, actors and fixtures in Gel; no new test cases")
+    ] = False,
 ) -> None:
     """Generate test cases with the LLM and store them in Gel only (fills gaps when cases exist)."""
     if from_ is None and not specs:
         raise typer.BadParameter("give spec files/folders or --from <analysis.json>")
     state = PipelineGraphState(
-        start="plan" if from_ else "analyze", stop="plan", spec_paths=specs or [], analysis_file=from_, replace=replace
+        start="plan" if from_ else "analyze",
+        stop="plan",
+        spec_paths=specs or [],
+        analysis_file=from_,
+        replace=replace,
+        refresh_only=refresh_only,
     )
     state = await _pipeline(state)
     if from_ is None:
@@ -412,6 +462,9 @@ async def heal_(
     tags: TagsOpt = None,
     verify: Annotated[bool, typer.Option(help="rebuild + re-run healed cases; roll back heals that still fail")] = True,
     max_cases: Annotated[int, typer.Option(help="max test cases to heal")] = 20,
+    lint: Annotated[
+        bool, typer.Option(help="heal cases that violate the current validation rules (no failed run needed)")
+    ] = False,
 ) -> None:
     """Repair test cases whose failures were diagnosed as TEST_DEFECT (run `srg diagnose` first)."""
     state = await _pipeline(
@@ -422,6 +475,7 @@ async def heal_(
             diagnose_run_id=run_id,
             heal_verify=verify,
             max_heal_cases=max_cases,
+            heal_lint=lint,
         )
     )
     print_healing(state, show_empty=True)
@@ -447,6 +501,8 @@ async def diagnose(
             force=force,
             diagnose_run_id=run_id,
             rerun_failures=rerun,
+            max_llm_diagnoses=max_llm,
+            group_failures=group,
         )
     )
     print_diagnosis(state, show_empty=True)
@@ -504,6 +560,36 @@ async def cases(
 
 @app.command()
 @run_async
+async def recipes() -> None:
+    """List the setup recipes (verified ones are offered to the planner and the healer)."""
+    client = db.create_client()
+    try:
+        rows = await repo.recipe_rows(client)
+    finally:
+        await client.aclose()
+    t = Table("recipe", "status", "description", "verification", title=f"{len(rows)} setup recipes")
+    for r in rows:
+        t.add_row(r.name, str(r.status), r.description, (r.verify_result or "")[:200])
+    console.print(t)
+
+
+@app.command()
+@run_async
+async def lessons() -> None:
+    """List the lessons learned from verified heals (fed into planner and healer prompts)."""
+    client = db.create_client()
+    try:
+        rows = await repo.lessons(client, limit=500)
+    finally:
+        await client.aclose()
+    t = Table("hits", "lesson", "endpoints", title=f"{len(rows)} lessons")
+    for r in rows:
+        t.add_row(str(r.hits), r.text, "\n".join(r.endpoints) or "(all)")
+    console.print(t)
+
+
+@app.command()
+@run_async
 async def show(
     test_id: str,
     approve: Annotated[bool, typer.Option(help="set design status to READY")] = False,
@@ -543,7 +629,7 @@ LOCAL_HOSTS = {"localhost", "127.0.0.1", "::1", "gel", "minio", "srg-gel", "srg-
 @run_async
 async def reset(
     yes: Annotated[bool, typer.Option("--yes", "-y", help="do not ask for confirmation")] = False,
-    files: Annotated[bool, typer.Option(help="also delete test_generated/ and reports/")] = False,
+    files: Annotated[bool, typer.Option(help="also delete reports/ (test_generated/ is always removed)")] = False,
     schema: Annotated[bool, typer.Option(help="also reset the Gel schema and re-apply migrations")] = False,
     force_remote: bool = False,
 ) -> None:
@@ -555,14 +641,20 @@ async def reset(
     if not force_remote and not hosts <= LOCAL_HOSTS:
         console.print(f"[red]Refusing to reset non-local services {hosts} (use --force-remote)[/]")
         raise typer.Exit(2)
+    deps = GraphDependencies(console=console)
+    problems = await check_services(deps, need_s3=True)
+    await deps.aclose()
+    if problems:
+        for p in problems:
+            console.print(f"[red]{p}[/]")
+        console.print("Start the services with [bold]docker compose up -d[/] - nothing was deleted.")
+        raise typer.Exit(2)
     client, store = db.create_client(s), TelemetryStore(s)
-    await store.ensure_bucket()
     counts = await db.counts(client)
     n_obj, size = await store.stats()
     console.print("Gel objects: " + ", ".join(f"{k}={v}" for k, v in counts.items() if v))
     console.print(f"S3 s3://{s.s3_bucket}: {n_obj} objects, {size / 1024:.1f} KiB")
-    if files:
-        console.print(f"Files: {s.test_generated_dir}/, {s.reports_dir}/")
+    console.print(f"Files: {s.test_generated_dir}/ (generated from Gel)" + (f", {s.reports_dir}/" if files else ""))
     if not yes and not typer.confirm("Delete all of this?"):
         await client.aclose()
         raise typer.Exit(1)
@@ -583,10 +675,11 @@ async def reset(
     if purge.failed:
         failed = True
         console.print(f"[red]S3: failed to delete {len(purge.failed)} keys (re-run reset)[/]")
-    if files:
-        for d in (s.test_generated_dir, s.reports_dir):
-            shutil.rmtree(d, ignore_errors=True)
-        console.print("Files: removed")
+    for d in (s.test_generated_dir, *([s.reports_dir] if files else [])):
+        shutil.rmtree(d, ignore_errors=True)
+    console.print(
+        "Files: removed " + ", ".join(str(d) for d in (s.test_generated_dir, *([s.reports_dir] if files else [])))
+    )
     raise typer.Exit(1 if failed else 0)
 
 

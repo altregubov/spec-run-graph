@@ -20,8 +20,9 @@ from spec_run_graph.domain.ir import (
     resolve_endpoint,
 )
 from spec_run_graph.knowledge.db import from_json, to_json
+from spec_run_graph.specs.contract import required_body_fields, response_facts
 from spec_run_graph.specs.diff import SpecChanges, diff_hashes
-from spec_run_graph.specs.models import LoadedSpec, sha256
+from spec_run_graph.specs.models import EndpointDraft, LoadedSpec, sha256
 
 Client = gel.AsyncIOExecutor
 
@@ -125,7 +126,8 @@ async def persist_specs(client: gel.AsyncIOClient, specs: list[LoadedSpec], repo
                                 operation_id := <optional str>$op, summary := <optional str>$summary,
                                 tag := <optional str>$tag, parameters := <json>$params,
                                 request_schema := <optional json>$req, response_schemas := <json>$res,
-                                contract_hash := <str>$ch,
+                                contract_hash := <str>$ch, requires_auth := <bool>$auth,
+                                required_body_fields := <array<str>>$rbf, assertable_paths := <json>$ap,
                             }
                             """,
                             spec=spec_id,
@@ -138,6 +140,9 @@ async def persist_specs(client: gel.AsyncIOClient, specs: list[LoadedSpec], repo
                             req=to_json(e.request_schema),
                             res=to_json(e.response_schemas),
                             ch=e.contract_hash,
+                            auth=e.requires_auth,
+                            rbf=required_body_fields(e.request_schema),
+                            ap=to_json(response_facts(e.response_schemas)),
                         )
                 out.spec_ids[s.name] = spec_id
                 for e in await tx.query("select ApiEndpoint { id, key, path } filter .spec.id = <uuid>$s", s=spec_id):
@@ -266,6 +271,13 @@ async def upsert_module(
     target_spec_id: str | None,
     product_spec_id: str | None,
 ) -> None:
+    existing = await client.query_single("select TestModule { folder } filter .code = <str>$c", c=m.code)
+    folder = existing.folder if existing else m.folder
+    if existing is None:  # a new module must not take the folder of another module
+        taken = set(await client.query("select TestModule.folder"))
+        base, n = folder, 2
+        while folder in taken:
+            folder, n = f"{base}-{n}", n + 1
     await client.query(
         """
         with
@@ -278,7 +290,7 @@ async def upsert_module(
             default_headers := <json>$headers, default_preconditions := <array<str>>$pre,
         } unless conflict on .code else (
             update TestModule set {
-                folder := <str>$folder, domain := <str>$domain, analysis := a,
+                domain := <str>$domain, analysis := a,  # folder is kept: renaming would orphan its files
                 target_spec := ts ?? .target_spec, product_spec := ps ?? .product_spec,
                 base_path := <str>$base, default_headers := <json>$headers,
                 default_preconditions := <array<str>>$pre, updated_at := datetime_current(),
@@ -289,7 +301,7 @@ async def upsert_module(
         ts=target_spec_id,
         ps=product_spec_id,
         code=m.code,
-        folder=m.folder,
+        folder=folder,
         domain=m.domain,
         base=m.base_path,
         headers=to_json(m.default_headers),
@@ -407,6 +419,7 @@ def _step_rows(case: CaseDraft, persisted: PersistedSpecs) -> list[dict[str, Any
                 "is_cleanup": is_cleanup,
                 "name": s.name,
                 "step_type": s.type.upper(),
+                "actor_name": s.actor,
                 "endpoint": endpoint_id,
                 "method": method.upper() if method else None,
                 "path": path.strip() if path else None,
@@ -490,7 +503,7 @@ async def _insert_steps(tx: Client, test_id: str, case: CaseDraft, persisted: Pe
             insert TestStep {
                 test_case := (select TestCase filter .test_id = <str>$tid),
                 seq := <int16>$seq, is_cleanup := <bool>$is_cleanup, name := <str>$name,
-                step_type := <StepType><str>$step_type,
+                step_type := <StepType><str>$step_type, actor_name := <optional str>$actor_name,
                 endpoint := (select ApiEndpoint filter .id = <optional uuid>$endpoint),
                 method := <HttpMethod><optional str>$method, path := <optional str>$path,
                 request := <optional json>$request, expected_status := <optional str>$expected_status,
@@ -510,7 +523,7 @@ CASE_SHAPE = """
     preconditions, variables, parameters, expected_results,
     script_path, script_hash, ir_hash, generation_attempts, gen_model, last_gen_error,
     test_module: { code, folder },
-    steps: { seq, is_cleanup, name, step_type, method, path, request, expected_status,
+    steps: { seq, is_cleanup, name, step_type, actor_name, method, path, request, expected_status,
              validate_schema, extract, assertions, poll, delay_ms, timeout_ms,
              endpoint: { key } } order by .seq,
 """
@@ -522,6 +535,7 @@ def row_to_ir(r: Any) -> TestCaseIR:
         step = StepIR(
             step=s.seq,
             name=s.name,
+            actor=s.actor_name,
             type=str(s.step_type).lower(),
             endpoint=f"{s.method} {s.path}" if s.method else None,
             request=from_json(s.request) or {},
@@ -608,6 +622,31 @@ async def set_design_status(client: Client, test_id: str, status: str) -> bool:
         s=status,
     )
     return row is not None
+
+
+async def endpoint_drafts(client: Client) -> dict[str, EndpointDraft]:
+    """All endpoints of the latest spec versions (for contract digests and validation contexts)."""
+    rows = await client.query(
+        """
+        select ApiEndpoint { method, path, operation_id, summary, tag, parameters, request_schema,
+                             response_schemas, requires_auth, spec: { created_at } }
+        """
+    )
+    latest: dict[str, EndpointDraft] = {}
+    for r in sorted(rows, key=lambda x: x.spec.created_at):
+        e = EndpointDraft(
+            method=str(r.method),
+            path=r.path,
+            operation_id=r.operation_id,
+            summary=r.summary,
+            tag=r.tag,
+            parameters=from_json(r.parameters) or [],
+            request_schema=from_json(r.request_schema),
+            response_schemas=from_json(r.response_schemas) or {},
+            requires_auth=bool(r.requires_auth),
+        )
+        latest[e.key] = e
+    return latest
 
 
 async def endpoint_schemas(client: Client, keys: list[str]) -> dict[str, Any]:
@@ -939,16 +978,21 @@ async def finish_heal_attempt(
     )
 
 
+HEAL_SHAPE = """
+    id, param_index, http_status, failed_assertions, error_message, created_at,
+    run: { run_id },
+    test_case: { test_id, tags, test_module: { code } },
+    diagnosis: { root_cause, evidence, suggested_fix, recommended_action, confidence },
+"""
+
+
 async def heal_candidates(client: Client, run_id: str) -> list[Any]:
-    """Failed executions of a run diagnosed as TEST_DEFECT (with enough confidence)."""
-    return list(
+    """TEST_DEFECT failures (confidence >= 0.5) of the run, plus cases still NEEDS_REVIEW because of a TEST_DEFECT
+    diagnosis of an earlier run (they are excluded from builds and runs, so no later run would re-diagnose them)."""
+    current = list(
         await client.query(
-            """
-            select TestExecution {
-                id, param_index, http_status, failed_assertions, error_message,
-                test_case: { test_id, tags, test_module: { code } },
-                diagnosis: { root_cause, evidence, suggested_fix, recommended_action, confidence },
-            }
+            f"""
+            select TestExecution {{ {HEAL_SHAPE} }}
             filter .run.run_id = <str>$run and .diagnosis.category = DiagnosticCategory.TEST_DEFECT
                and .diagnosis.confidence >= 0.5
                and .test_case.design_status != DesignStatus.DEPRECATED
@@ -957,6 +1001,25 @@ async def heal_candidates(client: Client, run_id: str) -> list[Any]:
             run=run_id,
         )
     )
+    in_run = {ex.test_case.test_id for ex in current}
+    stuck = await client.query(
+        f"""
+        select TestExecution {{ {HEAL_SHAPE} }}
+        filter .diagnosis.category = DiagnosticCategory.TEST_DEFECT and .diagnosis.confidence >= 0.5
+           and .test_case.design_status = DesignStatus.NEEDS_REVIEW
+           and .test_case.review_reason like 'diagnosis %'
+        order by .created_at desc
+        """
+    )
+    latest_run: dict[str, str] = {}
+    for ex in stuck:  # newest first: keep only the most recent failing run per case
+        tid = ex.test_case.test_id
+        if tid in in_run:
+            continue
+        latest_run.setdefault(tid, ex.run.run_id)
+        if latest_run[tid] == ex.run.run_id:
+            current.append(ex)
+    return current
 
 
 async def heal_history(client: Client, test_id: str) -> list[dict[str, Any]]:
@@ -967,3 +1030,116 @@ async def heal_history(client: Client, test_id: str) -> list[dict[str, Any]]:
         t=test_id,
     )
     return json.loads(raw)
+
+
+async def existing_actors(client: Client) -> dict[str, list[str]]:
+    rows = await client.query("select TestModule { code, actors: { name } order by .name } order by .code")
+    return {m.code: [a.name for a in m.actors] for m in rows if m.actors}
+
+
+async def verified_heals(client: Client, run_id: str) -> set[str]:
+    """Test ids already healed and verified for failures of this run."""
+    return set(
+        await client.query(
+            """select distinct (select HealAttempt filter .run_id = <str>$r
+                                and .status = HealStatus.VERIFIED).test_case.test_id""",
+            r=run_id,
+        )
+    )
+
+
+# ---------------------------------------------------------------- setup recipes
+
+
+async def save_recipe(
+    client: Client, recipe: Any, status: str, verify_result: str, analysis_id: str, model: str
+) -> None:
+    await client.query(
+        """
+        insert SetupRecipe {
+            name := <str>$name, description := <str>$desc, definition := <json>$defn,
+            status := <RecipeStatus><str>$status, verify_result := <str>$vr,
+            analysis_id := <str>$aid, model_name := <str>$model,
+        }
+        unless conflict on .name else (
+            update SetupRecipe set {
+                description := <str>$desc, definition := <json>$defn, status := <RecipeStatus><str>$status,
+                verify_result := <str>$vr, analysis_id := <str>$aid, model_name := <str>$model,
+                updated_at := datetime_current(),
+            }
+        )
+        """,
+        name=recipe.name,
+        desc=recipe.description,
+        defn=to_json(recipe.model_dump(mode="json", exclude_defaults=True)),
+        status=status,
+        vr=verify_result[:4000],
+        aid=analysis_id,
+        model=model,
+    )
+
+
+async def load_recipes(client: Client, statuses: tuple[str, ...] = ("VERIFIED",)) -> dict[str, Any]:
+    from spec_run_graph.domain.recipes import RecipeIR
+
+    rows = await client.query(
+        "select SetupRecipe { name, definition } filter <str>.status in array_unpack(<array<str>>$s)",
+        s=list(statuses),
+    )
+    return {r.name: RecipeIR.model_validate(from_json(r.definition)) for r in rows}
+
+
+async def recipe_rows(client: Client) -> list[Any]:
+    return list(
+        await client.query(
+            "select SetupRecipe { name, description, status, verify_result, analysis_id, created_at } order by .name"
+        )
+    )
+
+
+async def recipes_designed_for(client: Client, analysis_id: str) -> bool:
+    return bool(
+        await client.query_single("select exists (select SetupRecipe filter .analysis_id = <str>$a)", a=analysis_id)
+    )
+
+
+# ---------------------------------------------------------------- lessons
+
+
+async def add_lesson(client: Client, text: str, endpoints: list[str], heal_ids: list[str], model: str) -> None:
+    await client.query(
+        """
+        with heals := (select HealAttempt filter .id in <uuid>array_unpack(<array<str>>$heals))
+        insert Lesson { text := <str>$text, endpoints := <array<str>>$eps, heals := heals, model_name := <str>$model }
+        unless conflict on .text else (
+            update Lesson set {
+                hits := .hits + 1, heals += heals, endpoints := <array<str>>$eps, updated_at := datetime_current()
+            }
+        )
+        """,
+        text=text,
+        eps=endpoints,
+        heals=heal_ids,
+        model=model,
+    )
+
+
+async def confirm_lesson(client: Client, text: str, heal_ids: list[str]) -> None:
+    await client.query(
+        """
+        with heals := (select HealAttempt filter .id in <uuid>array_unpack(<array<str>>$heals))
+        update Lesson filter .text = <str>$text set { hits := .hits + 1, heals += heals, updated_at := datetime_current() }
+        """,
+        text=text,
+        heals=heal_ids,
+    )
+
+
+async def lessons(client: Client, endpoints: list[str] | None = None, limit: int = 15) -> list[Any]:
+    """Global lessons plus those about the given endpoints, most confirmed first."""
+    rows = await client.query(
+        "select Lesson { text, endpoints, hits, created_at } order by .hits desc then .created_at"
+    )
+    wanted = set(endpoints or [])
+    picked = [r for r in rows if not r.endpoints or endpoints is None or set(r.endpoints) & wanted]
+    return picked[:limit]

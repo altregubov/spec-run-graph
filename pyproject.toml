@@ -1,6 +1,6 @@
 [project]
 name = "spec-run-graph"
-version = "0.2.0"
+version = "0.3.0"
 description = "Spec-driven API test generation and execution: OpenAPI + PRD -> Gel -> Bruno (OpenCollection)"
 readme = "README.md"
 requires-python = ">=3.12,<3.14"

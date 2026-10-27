@@ -9,6 +9,7 @@ from typing import Any
 
 import yaml
 
+from spec_run_graph.specs.contract import required_body_fields, response_facts
 from spec_run_graph.specs.models import HTTP_METHODS, EndpointDraft, LoadedSpec
 
 MAX_REF_DEPTH = 12
@@ -197,9 +198,18 @@ def endpoint_digest(e: EndpointDraft) -> str:
         lines.append(f"  {p['in']} param {p['name']}{'*' if p['required'] else '?'}: {schema_brief(p.get('schema'))}")
     if e.request_schema is not None:
         lines.append(f"  body: {schema_brief(e.request_schema)}")
+        if required := required_body_fields(e.request_schema):
+            lines.append(f"    a successful request MUST send: {', '.join(required)}")
+    facts = response_facts(e.response_schemas)
+    groups: dict[tuple[str, str], list[str]] = {}  # identical schemas (e.g. the error envelope) are listed once
     for status, r in e.response_schemas.items():
         schema = f" -> {schema_brief(r['schema'])}" if r.get("schema") else ""
-        lines.append(f"  {status}: {r.get('description', '')}{schema}")
+        assertable = ", ".join(facts.get(str(status), []))
+        groups.setdefault((schema, assertable), []).append(f"{status} {r.get('description', '')}".strip())
+    for (schema, assertable), statuses in groups.items():
+        lines.append(f"  {' | '.join(statuses)}{schema}")
+        if assertable:
+            lines.append(f"    assertable (guaranteed) fields: {assertable}")
     return "\n".join(lines)
 
 

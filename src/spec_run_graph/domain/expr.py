@@ -22,7 +22,11 @@ from typing import Any
 
 OPS = ("==", "!=", ">=", "<=", ">", "<", "not exists", "exists", "contains", "matches", "in")
 UNARY = {"exists", "not exists"}
-PATH_RE = re.compile(r"^response\.(status|headers\.[A-Za-z0-9_\-]+|body((\.[A-Za-z_][A-Za-z0-9_\-]*)|(\[\d+\]))*)$")
+# body segments: .key | [index] | [field=literal] (select the list item whose field equals the literal)
+FILTER_LITERAL = r"(?:'[^']*'|-?\d+(?:\.\d+)?|true|false|\{\{\s*\$[a-z]+\.[A-Za-z0-9_.]+\s*\}\})"
+BODY_SEGMENT = rf"(?:\.[A-Za-z_][A-Za-z0-9_\-]*|\[\d+\]|\[[A-Za-z_][A-Za-z0-9_]*={FILTER_LITERAL}\])"
+PATH_PATTERN = rf"response\.(?:status|headers\.[A-Za-z0-9_\-]+|body{BODY_SEGMENT}*)"
+PATH_RE = re.compile(rf"^{PATH_PATTERN}$")
 TEMPLATE_RE = re.compile(r"^\{\{\s*\$[a-z]+\.[A-Za-z0-9_.]+\s*\}\}$")
 
 
@@ -81,14 +85,16 @@ def parse_literal(text: str) -> tuple[Any, bool]:
 
 def parse_check(text: str) -> Check:
     text = text.strip()
-    m = re.match(r"^(\S+)\s+(.*)$", text)
+    m = re.match(rf"^({PATH_PATTERN})\s+(.*)$", text)
     if not m:
-        raise CheckSyntaxError(f"expected '<path> <op> <value>', got {text!r}")
-    path, rest = m.group(1), m.group(2).strip()
-    if not PATH_RE.match(path):
+        first = text.split(None, 1)[0] if text else ""
+        if re.match(rf"^{PATH_PATTERN}$", first) and " " not in text:
+            raise CheckSyntaxError(f"expected '<path> <op> <value>', got {text!r}")
         raise CheckSyntaxError(
-            f"bad path {path!r}: use response.status, response.headers.<h> or response.body.<json.path>"
+            f"bad path {first!r}: use response.status, response.headers.<h> or response.body.<json.path> "
+            "(segments .key, [index] or [field='value'] to select a list item by attribute)"
         )
+    path, rest = m.group(1), m.group(2).strip()
     for op in OPS:
         if rest == op or rest.startswith(op + " ") or (op not in UNARY and op[0] in "=!<>" and rest.startswith(op)):
             remainder = rest[len(op) :].strip()

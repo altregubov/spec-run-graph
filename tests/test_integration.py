@@ -7,6 +7,7 @@ never touched. LLM calls use test models; production uses the .env model.  Run: 
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import socket
 import subprocess
@@ -28,6 +29,10 @@ from spec_run_graph.pipeline.graph import PipelineGraphState, run_pipeline
 from spec_run_graph.telemetry.s3 import TelemetryStore
 
 pytestmark = pytest.mark.integration
+
+# The example Orders API's demo tokens; tests must not rely on the developer's .env
+os.environ.setdefault("CUSTOMER_TOKEN", "customer-token")
+os.environ.setdefault("ADMIN_TOKEN", "admin-token")
 BRANCH = "srg_test"
 
 
@@ -112,6 +117,7 @@ async def test_plan_build_test_end_to_end(deps):
     specs = orders_specs()
     report = orders_report(specs)
     ref = [c.model_dump(exclude={"id", "status"}) for c in reference_module().test_cases]
+    ref[1]["steps"][0]["expected_error"].pop("field")  # optional in the contract: rejected by the planner rules
     deps.model = tool_model({"cases": ref})  # planner answer
     summary = await stages.plan_stage(deps, specs, report)
     assert summary.created["ORD"] == ["TC-ORD-001", "TC-ORD-002"]
@@ -220,6 +226,7 @@ async def test_plan_survives_a_failing_chunk(deps):
     specs = orders_specs()
     report = orders_report(specs)
     ref = [c.model_dump(exclude={"id", "status"}) for c in reference_module().test_cases]
+    ref[1]["steps"][0]["expected_error"].pop("field")  # optional in the contract: rejected by the planner rules
 
     def fn(messages, info):
         prompt = str(messages[0].parts[-1].content)
@@ -353,6 +360,9 @@ async def test_heal_verified(deps):
     assert [h["status"] for h in heals] == ["VERIFIED"] and heals[0]["verify_run_id"]
     # verification runs never become the default run for diagnose/heal
     assert await repo.latest_run_id(deps.client) == state.run.run_id
+    # healing the same run again does nothing (already verified)
+    again = await stages.heal_stage(deps, state.run.run_id)
+    assert again.rows == []
 
 
 async def test_heal_rolled_back_when_still_failing(deps):
@@ -362,3 +372,101 @@ async def test_heal_rolled_back_when_still_failing(deps):
     assert str(row.design_status) == "NEEDS_REVIEW" and "auto-heal failed" in row.review_reason
     assert "CONFIRMED" in row.steps[0].assertions  # original content restored
     assert [h["status"] for h in await repo.heal_history(deps.client, "TC-ORD-001")] == ["ROLLED_BACK"] * 2
+
+
+async def test_login_actor_runs_without_token_env(deps, monkeypatch):
+    """Actor credentials come from the spec; the collection logs in itself (no CUSTOMER_TOKEN needed)."""
+    from spec_run_graph.config import dotenv_values as real_dotenv
+    from spec_run_graph.domain.analysis import ActorDef, AuthDef
+    from spec_run_graph.pipeline import stages as stages_mod
+
+    monkeypatch.delenv("CUSTOMER_TOKEN", raising=False)
+    monkeypatch.setattr(
+        stages_mod,
+        "dotenv_values",
+        lambda *a, **k: {k2: v for k2, v in real_dotenv().items() if not k2.endswith("_TOKEN")},
+    )
+    specs = orders_specs()
+    report = orders_report(specs)
+    login = AuthDef(
+        type="login",
+        login_endpoint="POST /v1/login",
+        login_body={"username": "customer", "password": "customer123"},
+        token_path="data.token",
+    )
+    for m in report.analysis.modules:
+        m.actors = [ActorDef(name="customer_standard", auth=login)]
+    persisted = await repo.persist_specs(deps.client, specs, report)
+    await repo.insert_analysis(deps.client, report, list(persisted.spec_ids.values()))
+    for m in report.analysis.modules:
+        await repo.upsert_module(deps.client, m, report.analysis_id, persisted.spec_ids["Orders API"], None)
+    await repo.insert_cases(deps.client, "ORD", reference_module().test_cases, persisted)
+    deps.model = synthesizer_model()
+    await stages.build_stage(deps, CaseFilter())
+    files = list((deps.settings.engine_dir("bruno") / "orders").glob("TC-*.yml"))
+    assert files and all("process.env" not in f.read_text() for f in files)
+    assert all("{{auth_customer_standard}}" in f.read_text() for f in files)
+    run = await stages.test_stage(deps, CaseFilter())
+    by = {(o.test_id, o.param_index): o.status for o in run.outcomes}
+    assert by[("TC-ORD-001", 0)] == "PASSED"  # authenticated via the login script
+    assert by[("TC-ORD-002", 2)] == "FAILED"  # the seeded 500 defect is still found
+
+
+async def test_refresh_only_updates_actors_without_planning(deps):
+    from pydantic_ai.models.function import FunctionModel
+
+    from spec_run_graph.domain.analysis import AuthDef
+
+    specs, report, _, ids = await _seed_reference_cases(deps)
+    for m in report.analysis.modules:
+        m.folder = m.folder + "-renamed"  # a re-analysis may propose other folder names
+        for a in m.actors:
+            a.auth = AuthDef(
+                type="login",
+                login_endpoint="POST /v1/login",
+                login_body={"username": "customer", "password": "customer123"},
+                token_path="data.token",
+            )
+
+    def no_llm(messages, info):
+        raise AssertionError("refresh_only must not call the LLM")
+
+    deps.model = FunctionModel(no_llm)
+    summary = await stages.plan_stage(deps, specs, report, refresh_only=True)
+    assert summary.refreshed == ["PROD", "ORD"] and summary.created == {}
+    ctx = await repo.module_context(deps.client, "ORD")
+    assert ctx["folder"] == "orders"  # existing folder kept
+    assert ctx["actors"]["customer_standard"]["type"] == "login"
+    assert [c["id"] for c in await repo.existing_cases(deps.client, "ORD")] == ids
+
+
+async def test_stale_files_from_old_generation_are_ignored_and_removed(deps):
+    """After a reset, ids restart; old files with the same ids in another folder must not be mapped/run."""
+    await _seed_reference_cases(deps)
+    deps.model = synthesizer_model()
+    await stages.build_stage(deps, CaseFilter())
+    root = deps.settings.engine_dir("bruno")
+    old = root / "old-orders"
+    old.mkdir()
+    (old / "folder.yml").write_text("info:\n  name: old\n  type: folder\n")
+    stale = old / "TC-ORD-001-step1-legacy.yml"
+    stale.write_text(
+        (root / "orders" / "TC-ORD-001-step1-submit-draft-order-creation-request.yml")
+        .read_text()
+        .replace("{{process.env.CUSTOMER_TOKEN}}", "{{process.env.USER_A_TOKEN}}")
+    )
+    manifest = stages.load_manifest(deps)
+    manifest["old-orders/TC-ORD-001-step1-legacy.yml"] = {
+        "test_id": "TC-ORD-001",
+        "param_index": 0,
+        "step_seq": 1,
+        "file_step": 1,
+        "is_cleanup": False,
+    }
+    stages.manifest_path(deps).write_text(json.dumps(manifest))
+    run = await stages.test_stage(deps, CaseFilter())
+    by = {(o.test_id, o.param_index): o.status for o in run.outcomes}
+    assert by[("TC-ORD-001", 0)] == "PASSED"  # not SKIPPED/ERROR because of the stale file
+    await stages.build_stage(deps, CaseFilter())  # full build removes the orphan
+    assert not old.exists()
+    assert "old-orders/TC-ORD-001-step1-legacy.yml" not in stages.load_manifest(deps)

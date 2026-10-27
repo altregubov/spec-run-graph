@@ -8,6 +8,7 @@ Context variable syntax:
 
 from __future__ import annotations
 
+import contextlib
 import re
 from collections.abc import Iterator
 from dataclasses import dataclass, field
@@ -23,10 +24,12 @@ CaseType = Literal["positive", "negative", "boundary", "security", "rbac"]
 DesignStatus = Literal["draft", "ready", "needs_review", "deprecated"]
 Priority = Literal["P0", "P1", "P2"]
 
+REF_ENV_RE = re.compile(r"\{\{\s*\$env\.([A-Z][A-Z0-9_]*)\s*\}\}")
 REF_RE = re.compile(r"\{\{\s*\$([a-z]+)\.([A-Za-z0-9_.\-]+)\s*\}\}")
 ANY_TEMPLATE_RE = re.compile(r"\{\{(.*?)\}\}")
 SLUG_RE = re.compile(r"^[a-z0-9]+(-[a-z0-9]+)*$")
 IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+FILTER_IN_PATH = re.compile(r"\[[A-Za-z_][A-Za-z0-9_]*=")
 PARAM_TEMPLATE_RE = re.compile(r"^\{\{\s*\$param\.([A-Za-z0-9_]+)\s*\}\}$")
 NAMESPACES = {"faker", "fixture", "env", "extract", "param", "var"}
 
@@ -58,8 +61,9 @@ class PollIR(BaseModel):
 class StepIR(BaseModel):
     step: int | None = None
     name: str
-    type: Literal["http", "delay"] = "http"
+    type: Literal["http", "delay", "recipe"] = "http"
     endpoint: str | None = Field(None, description="'METHOD /openapi/path', path segments may be templates")
+    actor: str | None = Field(None, description="module actor for this step when it differs from the case actor")
     request: RequestIR = Field(default_factory=RequestIR)
     expected_status: int | str | None = Field(None, description="int, or '{{ $param.<key> }}'")
     validate_schema: bool = False
@@ -69,6 +73,10 @@ class StepIR(BaseModel):
     poll: PollIR | None = None
     delay_ms: int | None = None
     timeout_ms: int | None = None
+    # type=recipe: a verified setup recipe, expanded into ordinary steps before validation/storage
+    recipe: str | None = Field(None, description="recipe name (type=recipe only)")
+    inputs: dict[str, Any] = Field(default_factory=dict, description="recipe inputs (type=recipe only)")
+    alias: str | None = Field(None, description="recipe outputs become $extract.<alias>_<output> (type=recipe)")
 
     @model_validator(mode="before")
     @classmethod
@@ -163,6 +171,101 @@ class ValidationContext:
     requirement_ids: set[str] = field(default_factory=set)
     actors: set[str] = field(default_factory=set)
     fixtures: set[str] = field(default_factory=set)
+    env_vars: set[str] | None = None  # declared env variables; None = no restriction
+    # endpoint key -> {status: JSON schema} of documented responses; None = no field checking
+    response_schemas: dict[str, dict[str, Any]] | None = None
+    request_schemas: dict[str, Any] | None = None  # endpoint key -> request body JSON schema
+    page_limits: dict[str, tuple[str, int]] | None = None  # paginated endpoint -> (page-size param, maximum)
+
+
+def missing_required(schema: Any, payload: Any, where: str = "payload") -> list[str]:
+    """Required request-body fields absent from a literal payload (nested objects included)."""
+    node = _merged(schema)
+    if node is None or not isinstance(payload, dict):
+        return []
+    missing = [f"{where}.{k}" for k in node.get("required", []) if k not in payload]
+    for key, value in payload.items():
+        sub = (node.get("properties") or {}).get(key)
+        if isinstance(value, dict) and sub is not None:
+            missing += missing_required(sub, value, f"{where}.{key}")
+    return missing
+
+
+_PATH_PART = re.compile(r"\.([A-Za-z_][A-Za-z0-9_\-]*)|\[(\d+)\]|\[([A-Za-z_][A-Za-z0-9_]*)=(?:[^\]]+)\]")
+
+
+def _merged(schema: Any) -> dict[str, Any] | None:
+    """Merge allOf branches; None when the schema does not constrain properties (any/free-form)."""
+    if not isinstance(schema, dict) or "$ref_cycle" in schema:
+        return None
+    if "allOf" in schema:
+        merged: dict[str, Any] = {"type": "object", "properties": {}}
+        required: set[str] = set()
+        declared = False
+        for part in schema["allOf"]:
+            sub = _merged(part)
+            if sub is None:
+                return None
+            merged["properties"].update(sub.get("properties", {}))
+            if "required" in sub:
+                declared = True
+                required |= set(sub["required"])
+        if declared:
+            merged["required"] = sorted(required)
+            if sub.get("items"):
+                merged["items"] = sub["items"]
+        return merged
+    if "oneOf" in schema or "anyOf" in schema:
+        return None
+    return schema
+
+
+def body_path_problem(schema: Any, path: str) -> str | None:
+    """'response.body.data[0].product_id' vs the response schema -> problem text, or None if allowed/unknown."""
+    node = _merged(schema)
+    walked = "response.body"
+    for m in _PATH_PART.finditer(path.removeprefix("response.body")):
+        if node is None:
+            return None
+        if m.group(2) is not None or m.group(3) is not None:  # [n] or [field=value]
+            items = _merged(node.get("items")) if (node.get("type") == "array" or "items" in node) else None
+            if m.group(3) is not None and items and items.get("properties") and m.group(3) not in items["properties"]:
+                return (
+                    f"{walked}[{m.group(3)}=...] filters on a field the list items do not have "
+                    f"(available: {sorted(items['properties'])})"
+                )
+            node = items
+            walked += f"[{m.group(2) or m.group(3) + '=...'}]"
+            continue
+        key = m.group(1)
+        if node.get("type") == "array" or "items" in node:
+            if key == "length":
+                return None
+            return (
+                f"{walked} is a list: select an item before .{key} "
+                f"({walked}[0].{key} or a filter like {walked}[field='value'].{key})"
+            )
+        props = node.get("properties")
+        if not props or node.get("additionalProperties") not in (None, False):
+            return None
+        if key not in props:
+            return f"{walked}.{key} is not in the documented response (available: {sorted(props)})"
+        if "required" in node and key not in node["required"]:
+            return (
+                f"{walked}.{key} is optional in the contract (required: {sorted(node['required'])}), "
+                "the API may omit it - do not assert or extract it"
+            )
+        node = _merged(props[key])
+        walked += f".{key}"
+    return None
+
+
+def declared_env_vars(*objs: Any) -> set[str]:
+    """Env variable names declared by actors / fixtures: '{{ $env.X }}' references and {"env": "X"} values."""
+    import json as _json
+
+    text = _json.dumps([o.model_dump() if hasattr(o, "model_dump") else o for o in objs], default=str)
+    return set(REF_ENV_RE.findall(text)) | set(re.findall(r'"env":\s*"([A-Z][A-Z0-9_]*)"', text))
 
 
 def _strings(obj: Any) -> Iterator[str]:
@@ -248,6 +351,12 @@ def validate_case(case: CaseDraft, ctx: ValidationContext) -> list[str]:
                     errors.append(f"{where}: unknown fixture {name!r}; module fixtures: {sorted(ctx.fixtures)}")
                 elif ns == "env" and not re.fullmatch(r"[A-Z][A-Z0-9_]*", name):
                     errors.append(f"{where}: env names are UPPER_SNAKE ({name!r})")
+                elif ns == "env" and ctx.env_vars is not None and name not in ctx.env_vars:
+                    errors.append(
+                        f"{where}: $env.{name} is not a declared environment variable "
+                        f"(declared: {sorted(ctx.env_vars) or 'none'}). Do not use $env for test data such as ids: "
+                        "look the value up in an earlier step (e.g. GET the list, then extract) or use a fixture"
+                    )
                 elif ns == "extract" and name not in extracted:
                     errors.append(f"{where}: $extract.{name} is not extracted by an earlier step")
                 elif ns == "param" and name not in param_keys:
@@ -258,9 +367,15 @@ def validate_case(case: CaseDraft, ctx: ValidationContext) -> list[str]:
     check_refs("variables", case.variables, set(), {"faker", "fixture", "env"})
 
     extracted: set[str] = set()
+    created: set[str] = set()  # extract vars that hold ids of entities created by this case (non-login POST)
     resolved: list[str] = []
     for idx, (step, is_cleanup) in enumerate(http_steps(case), start=1):
         where = f"{'cleanup' if is_cleanup else 'step'} {idx} ({step.name})"
+        if step.actor and step.actor not in ctx.actors:
+            errors.append(f"{where}: unknown actor {step.actor!r}; module actors: {sorted(ctx.actors)}")
+        if step.type == "recipe":
+            errors.append(f"{where}: recipe {step.recipe!r} is not available (use only the listed recipes)")
+            continue
         if step.type == "delay":
             if not step.delay_ms or step.delay_ms <= 0:
                 errors.append(f"{where}: delay steps need delay_ms > 0")
@@ -307,6 +422,58 @@ def validate_case(case: CaseDraft, ctx: ValidationContext) -> list[str]:
                 errors.append(f"{where}: extract name {var!r} must be an identifier")
             if not PATH_RE.match(path):
                 errors.append(f"{where}: extract path {path!r} must be response.body.<path> or response.headers.<h>")
+        creates = any(200 <= s < 300 for s in _step_statuses(step, case.parameters))
+        if creates and ctx.request_schemas is not None and key and ctx.request_schemas.get(key):
+            missing = missing_required(ctx.request_schemas[key], step.request.payload)
+            if missing:
+                errors.append(
+                    f"{where}: the request is expected to succeed but misses fields the contract requires: "
+                    f"{missing} - send them (with valid values)"
+                )
+        if method == "POST" and creates and "login" not in step.endpoint.lower():
+            for field_name, value in _unique_literals(step.request.payload):
+                errors.append(
+                    f"{where}: {field_name}={value!r} is a fixed value for a field that must be unique; the entity may "
+                    "already exist from an earlier run (deletes can be soft). Use a per-run unique value, e.g. "
+                    "variables: {name: 'qa_{{ $faker.uuid }}'} and {{ $var.name }}"
+                )
+        if ctx.response_schemas is not None and key and key in ctx.response_schemas:
+            statuses = [str(s) for s in _step_statuses(step, case.parameters)]
+            schemas = [(ctx.response_schemas[key].get(s) or {}).get("schema") for s in statuses]
+            schemas = [sc for sc in schemas if sc]
+            paths = list(step.extract.values())
+            for a in step.assertions:
+                with contextlib.suppress(CheckSyntaxError):  # syntax errors are reported above
+                    chk = parse_check(a.check)
+                    if chk.op != "not exists":  # asserting that an undocumented field is absent is valid
+                        paths.append(chk.path)
+            for path in (p for p in paths if p.startswith("response.body")):
+                problems = [body_path_problem(sc, path) for sc in schemas]
+                if schemas and all(problems):
+                    errors.append(f"{where}: {problems[0]}; assert only documented fields")
+        if ctx.page_limits and key in ctx.page_limits and creates_or_cleanup(step, is_cleanup, case.parameters):
+            size_param, maximum = ctx.page_limits[key]
+            checks = [*step.extract.values(), *(a.check for a in step.assertions)]
+            filtered = [c for c in checks if FILTER_IN_PATH.search(c)]
+            if filtered and str(step.request.query.get(size_param, "")) != str(maximum):
+                errors.append(
+                    f"{where}: {filtered[0].split()[0]} searches one page of a paginated list - other tests add items, "
+                    f"so the wanted item can be on a later page. Send query {size_param}={maximum} and, where the "
+                    "endpoint supports it, sort newest first (e.g. sort_by=created_at, order=desc), or read the "
+                    "entity directly by id"
+                )
+        path_part = step.endpoint.split(None, 1)[1] if " " in step.endpoint else ""
+        path_vars = {n for ns, n in REF_RE.findall(path_part) if ns == "extract"}
+        mutates = method in ("PUT", "PATCH", "DELETE") or (method == "POST" and path_vars)
+        foreign = sorted(path_vars - created)
+        if mutates and foreign and creates_or_cleanup(step, is_cleanup, case.parameters):
+            errors.append(
+                f"{where}: modifies a pre-existing entity ({', '.join('$extract.' + v for v in foreign)} comes from a "
+                "lookup/login, not from a POST that created it in this case). Tests must not change shared seed data "
+                "(other tests depend on it): create a dedicated entity first (e.g. POST /api/admin/users) and modify that"
+            )
+        if method == "POST" and "login" not in step.endpoint.lower():
+            created |= set(step.extract)
         extracted |= set(step.extract)
         if step.validate_schema and key is None:
             errors.append(f"{where}: validate_schema needs a resolvable endpoint")
@@ -316,6 +483,40 @@ def validate_case(case: CaseDraft, ctx: ValidationContext) -> list[str]:
         if rk is None or rk not in resolved:
             errors.append(f"coverage endpoint {e!r} is not exercised by any step")
     return errors
+
+
+def creates_or_cleanup(step: StepIR, is_cleanup: bool, parameters: list[dict[str, Any]]) -> bool:
+    """Only steps that are expected to succeed actually modify data (negative tests may target anything)."""
+    return is_cleanup or any(200 <= s < 300 for s in _step_statuses(step, parameters))
+
+
+UNIQUE_FIELDS = {"username", "email", "login", "user_name"}
+
+
+def _unique_literals(payload: Any) -> list[tuple[str, str]]:
+    found: list[tuple[str, str]] = []
+    if isinstance(payload, dict):
+        for k, v in payload.items():
+            if k.lower() in UNIQUE_FIELDS and isinstance(v, str) and v.strip() and "{{" not in v:
+                found.append((k, v))
+            elif isinstance(v, dict | list):
+                found.extend(_unique_literals(v))
+    elif isinstance(payload, list):
+        for v in payload:
+            found.extend(_unique_literals(v))
+    return found
+
+
+def _step_statuses(step: StepIR, parameters: list[dict[str, Any]]) -> list[int]:
+    es = step.expected_status
+    if es is None:
+        return []
+    if isinstance(es, int) or str(es).strip().isdigit():
+        return [int(es)]
+    m = PARAM_TEMPLATE_RE.match(str(es).strip())
+    if m:
+        return [int(r[m.group(1)]) for r in parameters if str(r.get(m.group(1), "")).isdigit()]
+    return []
 
 
 def normalize(case: CaseDraft) -> CaseDraft:

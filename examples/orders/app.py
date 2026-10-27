@@ -6,7 +6,8 @@ Seeded defects (intentional, so generated tests have something to find):
   3. DELETE /v1/orders/{id} on an unknown id returns 200 instead of 404.
 
 Run:  uv run uvicorn examples.orders.app:app --port 8000
-Auth: Bearer token "customer-token" (customer) or "admin-token" (admin).
+Auth: Bearer token "customer-token" (customer) or "admin-token" (admin);
+      POST /v1/login {"username": "customer", "password": "customer123"} returns the token.
 """
 
 from __future__ import annotations
@@ -58,6 +59,22 @@ class OrderItem(BaseModel):
 
 class CreateOrder(BaseModel):
     items: list[OrderItem] = Field(min_length=1)
+
+
+ACCOUNTS = {"customer": ("customer123", "customer-token"), "admin": ("admin123", "admin-token")}
+
+
+class Login(BaseModel):
+    username: str
+    password: str
+
+
+@app.post("/v1/login")
+def login(body: Login):
+    account = ACCOUNTS.get(body.username)
+    if account is None or account[0] != body.password:
+        return error(401, "INVALID_CREDENTIALS", "Invalid username or password")
+    return {"data": {"token": account[1]}}
 
 
 @app.get("/")

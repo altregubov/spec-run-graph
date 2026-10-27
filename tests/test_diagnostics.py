@@ -93,10 +93,31 @@ async def test_agent_investigates_with_tools_then_diagnoses():
 
 
 async def test_low_confidence_becomes_unknown():
-    answer = {"category": "FLAKY", "root_cause": "maybe timing", "recommended_action": "re-run", "confidence": 0.3}
+    answer = {
+        "category": "FLAKY",
+        "root_cause": "maybe a timing issue between order creation and the read",
+        "evidence": ["passed in an earlier run"],
+        "recommended_action": "re-run the case",
+        "confidence": 0.3,
+    }
 
     def fn(messages, info):
         return ModelResponse(parts=[ToolCallPart(info.output_tools[0].name, answer)])
 
     d = await diagnostics.diagnose(_deps(failure(), []), model=FunctionModel(fn))
     assert d.category == "UNKNOWN" and "low confidence FLAKY" in d.root_cause
+
+
+def test_placeholder_diagnoses_are_rejected():
+    from spec_run_graph.agents.diagnostics import Diagnosis, diagnosis_problems
+
+    junk = Diagnosis(category="UNKNOWN", root_cause="placeholder", recommended_action="placeholder", confidence=0)
+    assert len(diagnosis_problems(junk)) == 2
+    good = Diagnosis(
+        category="TEST_DEFECT",
+        root_cause="The test asserts total_count but the API returns no such field",
+        evidence=["total_count undefined"],
+        recommended_action="Fix the test assertion",
+        confidence=0.8,
+    )
+    assert diagnosis_problems(good) == []

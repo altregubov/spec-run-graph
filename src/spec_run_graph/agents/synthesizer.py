@@ -15,7 +15,8 @@ from pydantic_ai.models import Model
 from spec_run_graph.config import get_settings
 from spec_run_graph.domain.ir import TestCaseIR, http_steps, resolve_endpoint
 from spec_run_graph.engines.bruno.naming import PlannedFile, var_prefix
-from spec_run_graph.engines.bruno.scaffold import env_template, fixture_template
+from spec_run_graph.engines.bruno.normalize import normalize_text
+from spec_run_graph.engines.bruno.scaffold import actor_auth, fixture_template
 from spec_run_graph.engines.bruno.validate import expected_status_for, validate_files
 from spec_run_graph.llm import build_model, output_spec, run_structured
 
@@ -32,7 +33,7 @@ http:
   headers: [{name: X-Header, value: "..."}]
   params: [{name: page, value: "1", type: query}]          # query parameters
   body: {type: json, data: "<JSON text>"}                   # omit when there is no payload
-  auth: {type: bearer, token: "{{process.env.CUSTOMER_TOKEN}}"}   # from the actor; omit for no auth
+  auth: <exactly the "auth" block given for this file in the plan>   # omit when the plan gives none
 runtime:
   assertions:    [{expression: res.status, operator: eq, value: "201"}, ...]
   actions:       [{type: set-variable, phase: after-response,
@@ -56,15 +57,22 @@ Translation rules (IR -> Bruno):
   ALWAYS assert the expected status first: {expression: res.status, operator: eq, value: "<status>"}.
 - For checks that are awkward as assertions (in, contains, matches, nested arrays) write a tests script:
   test("<message>", function () { expect(res.getBody().data.status).to.be.oneOf(["A", "B"]); });
-- validate_schema: true -> tests script with ajv and the given response schema:
-  const Ajv = require("ajv"); const ajv = new Ajv({allErrors: true, strict: false});
-  const validate = ajv.compile(<schema JSON>);
-  test("response matches the OpenAPI schema", function () {
-    expect(validate(res.getBody()), JSON.stringify(validate.errors)).to.equal(true); });
+- validate_schema: true -> do NOT write schema validation code (no ajv): the framework appends the OpenAPI
+  schema check to those files automatically.
+- List filters in paths (response.body.data[model='Galaxy S24'].id) select the item whose field equals the value.
+  Bruno assertions/actions cannot filter, so implement them in scripts with Array.find:
+    check  -> tests script: const item = (res.getBody().data || []).find(x => x.model === "Galaxy S24");
+              test("<message>", function () { expect(item?.price).to.be.above(10); });
+    extract -> after-response script: bru.setVar("<PREFIX>x", ((res.getBody().data || []).find(x => x.model === "Galaxy S24") || {}).id);
+  A template filter value ({{ $extract.pid }}) is read in JS with bru.getVar("<PREFIX>pid").
 - delay steps: put `await bru.sleep(<ms>);` in the before-request script of the NEXT file.
 - cleanup files: same format, but NO assertions and no tests (their failures are ignored).
+- Authentication: every planned file lists the actor of its step and that actor's "auth" block - copy it
+  verbatim. Never invent token variables. Only for steps that deliberately test missing/invalid credentials
+  use explicit headers (e.g. Authorization: Bearer invalid-token) or no auth.
 - Never write secrets or tokens literally. Only these templates are allowed: {{baseUrl}},
-  {{process.env.X}}, the fixture templates, {{<PREFIX>...}} runtime variables, Bruno {{$random...}} variables.
+  {{process.env.X}} for env variables that appear in the IR or the auth blocks, the fixture templates,
+  {{auth_<actor>}} tokens from the auth blocks, {{<PREFIX>...}} runtime variables, Bruno {{$random...}} variables.
 Return every planned file with exactly the planned filename and content as YAML text."""
 
 EXAMPLE = """\
@@ -87,7 +95,7 @@ http:
       {"items": [{"sku": "{{fx_ORD_active_sku}}", "qty": 2}]}
   auth:
     type: bearer
-    token: "{{process.env.CUSTOMER_TOKEN}}"
+    token: "{{auth_customer}}"
 runtime:
   assertions:
     - expression: res.status
@@ -149,7 +157,8 @@ def build_agent(output: Any = None) -> Agent[SynthDeps, SynthesizedFiles]:
     def check(ctx: RunContext[SynthDeps], out: SynthesizedFiles) -> SynthesizedFiles:
         d = ctx.deps
         d.attempts += 1
-        files = {f.filename.rsplit("/", 1)[-1]: f.content for f in out.files}
+        # deterministic repairs first (query params into url, auth vs explicit header, regex quotes)
+        files = {f.filename.rsplit("/", 1)[-1]: normalize_text(f.content)[0] for f in out.files}
         errors, parsed = validate_files(d.case, d.module, d.planned, files, d.secrets)
         d.last_errors = errors
         if errors:
@@ -172,7 +181,7 @@ def build_prompt(
     }
     actors = {}
     for name, auth in module["actors"].items():
-        actors[name] = {k: env_template(v) if isinstance(v, str) else v for k, v in auth.items()}
+        actors[name] = actor_auth({**auth, "_actor": name})
     file_plan = []
     for p in planned:
         step, _ = steps[p.step_seq - 1]
@@ -180,6 +189,8 @@ def build_prompt(
             "filename": p.filename,
             "info.name": p.display_name,
             "implements": f"{'cleanup' if p.is_cleanup else 'step'} #{p.step_seq} '{step.name}'",
+            "actor": step.actor or case.actor,
+            "auth": actors.get(step.actor or case.actor or ""),
             "expected_status": None if p.is_cleanup else expected_status_for(case, p.step_seq, p.param_index),
         }
         if case.parameters:
@@ -235,4 +246,45 @@ async def synthesize(
         if not deps.last_errors:
             deps.last_errors = [str(exc)]
         return None, deps
+    add_schema_checks(case, planned, deps.parsed, endpoints)
     return deps.parsed, deps
+
+
+def _strip_examples(schema: Any) -> Any:
+    if isinstance(schema, dict):
+        return {k: _strip_examples(v) for k, v in schema.items() if k not in ("example", "examples", "description")}
+    if isinstance(schema, list):
+        return [_strip_examples(v) for v in schema]
+    return schema
+
+
+def schema_check_script(schema: Any) -> str:
+    return (
+        "// srg: response schema check generated from the OpenAPI contract\n{\n"
+        '  const Ajv = require("ajv");\n'
+        "  const ajv = new Ajv({ allErrors: true, strict: false });\n"
+        f"  const validate = ajv.compile({json.dumps(_strip_examples(schema), separators=(',', ':'))});\n"
+        '  test("response matches the OpenAPI schema", function () {\n'
+        "    expect(validate(res.getBody()), JSON.stringify(validate.errors)).to.equal(true);\n"
+        "  });\n}"
+    )
+
+
+def add_schema_checks(
+    case: TestCaseIR, planned: list[PlannedFile], parsed: dict[str, dict], endpoints: dict[str, Any]
+) -> None:
+    """Deterministically append the ajv schema check to files of steps with validate_schema (the LLM used to copy
+    multi-KB schemas into the script and mangle them)."""
+    steps = http_steps(case)
+    paths = {k: k.split(" ", 1)[1] for k in endpoints}
+    for p in planned:
+        step, is_cleanup = steps[p.step_seq - 1]
+        if is_cleanup or not step.validate_schema or not step.endpoint or p.filename not in parsed:
+            continue
+        key = resolve_endpoint(step.endpoint, paths)
+        status = expected_status_for(case, p.step_seq, p.param_index)
+        schema = ((endpoints.get(key or "", {}).get("responses") or {}).get(str(status)) or {}).get("schema")
+        if not schema:
+            continue
+        runtime = parsed[p.filename].setdefault("runtime", {})
+        runtime.setdefault("scripts", []).append({"type": "tests", "code": schema_check_script(schema)})

@@ -134,7 +134,7 @@ class _Renderer:
             http["params"] = [
                 {"name": k, "value": str(self.deep(v, row)), "type": "query"} for k, v in step.request.query.items()
             ]
-        actor = self.actors.get(self.case.actor or "")
+        actor = entry.get("auth") or self.actors.get(step.actor or self.case.actor or "")
         if actor and actor.get("type") == "bearer":
             http["auth"] = {"type": "bearer", "token": actor["token"]}
         doc: dict[str, Any] = {

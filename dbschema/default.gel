@@ -13,6 +13,7 @@ module default {
   scalar type DiagnosticCategory extending enum<APPLICATION_BUG, SPEC_MISMATCH, TEST_DEFECT, ENV_FAILURE, FLAKY, UNKNOWN>;
   scalar type DiagnosticSource extending enum<RULE, LLM>;
   scalar type HealStatus extending enum<VERIFIED, ROLLED_BACK, UNVERIFIED, REJECTED>;
+  scalar type RecipeStatus extending enum<VERIFIED, FAILED, UNVERIFIED>;
 
   abstract type Timestamped {
     required created_at: datetime { default := datetime_current(); readonly := true; }
@@ -43,6 +44,10 @@ module default {
     parameters: json;
     request_schema: json;
     response_schemas: json;              # {"201": {"description": ..., "schema": ...}}
+    requires_auth: bool;
+    # contract facts (derived from the schemas at ingest; prompts and IR validation follow them literally)
+    required_body_fields: array<str>;    # fields a successful request must send, e.g. ["role", "address.city"]
+    assertable_paths: json;              # {"201": ["response.body.data.id", ...]} - guaranteed (required) fields
     required contract_hash: str;         # hash of params + request + response schemas
     property key := <str>.method ++ ' ' ++ .path;
     constraint exclusive on ((.spec, .method, .path));
@@ -139,6 +144,7 @@ module default {
     required is_cleanup: bool { default := false; }   # cleanup failures don't fail the case
     required name: str;
     required step_type: StepType { default := StepType.HTTP; }
+    actor_name: str;                     # actor of this step when it differs from the case actor
     endpoint: ApiEndpoint;               # resolved coverage link
     method: HttpMethod;
     path: str;                           # may contain {{ $extract.order_id }}
@@ -218,6 +224,28 @@ module default {
     required after_ir: json;
     verify_run_id: str;                  # verification run
     verify_result: str;
+    model_name: str;
+  }
+
+  # Reusable setup step sequences (designed by the LLM, verified against the SUT); the planner calls them
+  # with a `recipe` step that is expanded into ordinary steps before storage.
+  type SetupRecipe extending Timestamped {
+    required name: str { constraint exclusive; }
+    required description: str;
+    required definition: json;           # RecipeIR
+    required status: RecipeStatus;
+    verify_result: str;
+    required analysis_id: str;           # analysis the recipe was designed for
+    model_name: str;
+  }
+
+  # Generic rules learned from verified heals ("the API returns the request id only in x-request-id");
+  # fed into planner and healer prompts so the same defect is not generated again.
+  type Lesson extending Timestamped {
+    required text: str { constraint exclusive; }
+    required endpoints: array<str> { default := <array<str>>[]; }   # empty = applies everywhere
+    required hits: int32 { default := 1; }   # verified heals that confirmed the lesson
+    multi heals: HealAttempt { on target delete allow; }
     model_name: str;
   }
 }

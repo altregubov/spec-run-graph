@@ -43,7 +43,7 @@ def test_guards_reject_unsafe_heals(deps):
     undocumented.steps[0].expected_status = 500  # "heal" the test to accept a crash
     assert any("not documented" in e for e in guard_errors(undocumented, deps))
     fewer = deps.original.model_copy(update={"cleanup": []})
-    assert any("same endpoints" in e for e in guard_errors(fewer, deps))
+    assert any("missing ['DELETE /v1/orders/{orderId}']" in e for e in guard_errors(fewer, deps))
     no_reqs = deps.original.model_copy(deep=True)
     no_reqs.coverage.requirement_refs = []
     assert any("requirement_refs" in e for e in guard_errors(no_reqs, deps))
@@ -78,3 +78,13 @@ async def test_unhealable_is_returned_unchanged(deps):
 
     out = await healer.heal("prompt", deps, model=FunctionModel(fn))
     assert out.unhealable_reason.startswith("the API returns 500")
+
+
+def test_setup_steps_on_extra_endpoints_are_allowed(deps):
+    """Isolation fixes add setup steps (e.g. create a dedicated entity) - the guard must not reject them."""
+    from spec_run_graph.domain.ir import StepIR
+
+    healed = deps.original.model_copy(deep=True)
+    healed.steps.insert(0, StepIR(name="look up catalog", endpoint="GET /v1/products", expected_status=200))
+    deps.documented_statuses["GET /v1/products"] = {200}
+    assert guard_errors(healed, deps) == []

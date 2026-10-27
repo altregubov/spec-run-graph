@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 from dataclasses import dataclass
 from typing import Any
@@ -25,8 +26,13 @@ Produce:
    - code: short UPPERCASE id used in test ids (ORD, PROD, AUTH, USER ...), unique.
    - folder: kebab-case plural noun (orders, catalog, users), unique.
    - endpoints: endpoint keys exactly as given ("METHOD /path"); every endpoint belongs to exactly one module.
-   - actors: roles needed for testing with their auth. Secrets are ALWAYS env references,
-     e.g. token: "{{ $env.CUSTOMER_TOKEN }}". Use the env variable names mentioned in the documents.
+   - actors: roles needed for testing with their auth.
+     * If the documents describe a login endpoint AND test accounts (seed data, example credentials), use
+       auth {type: "login", login_endpoint: "POST /api/.../login", login_body: {"username": "...",
+       "password": "..."}, token_path: "data.token"} with the documented credentials - one actor per account
+       (e.g. admin, user_a, user_b). The test collection logs in at run time; never invent credentials.
+     * Otherwise secrets are env references, e.g. {type: "bearer", token: "{{ $env.CUSTOMER_TOKEN }}"}.
+     * If "Existing actors" are listed below, reuse those actor names for the same accounts.
    - fixtures: reusable test data mentioned in the documents (e.g. active_sku: "SKU-ACTIVE-1").
    - default_headers: e.g. {"Accept": "application/json"}.
    - base_path: leave empty unless the server prefix is NOT already part of the OpenAPI paths.
@@ -66,6 +72,14 @@ def _validate(analysis: SpecAnalysis, deps: AnalyzerDeps) -> list[str]:
                 errors.append(f"module {m.code}: unknown endpoint {e!r}")
         owned.extend(m.endpoints)
         for a in m.actors:
+            if a.auth.type == "login":
+                if a.auth.login_endpoint not in known:
+                    errors.append(f"actor {a.name}: login_endpoint {a.auth.login_endpoint!r} is not an endpoint key")
+                if not a.auth.login_body:
+                    errors.append(f"actor {a.name}: login actors need login_body with the documented credentials")
+                if not a.auth.token_path:
+                    errors.append(f"actor {a.name}: login actors need token_path (e.g. data.token)")
+                continue
             for secret in (a.auth.token, a.auth.password, a.auth.value):
                 if secret and not re.fullmatch(r"\{\{\s*\$env\.[A-Z][A-Z0-9_]*\s*\}\}", secret.strip()):
                     errors.append(f"actor {a.name}: secrets must be '{{{{ $env.VAR }}}}' references")
@@ -108,17 +122,21 @@ def build_agent(output: Any = None) -> Agent[AnalyzerDeps, SpecAnalysis]:
     return agent
 
 
-def build_prompt(specs: list[LoadedSpec]) -> str:
+def build_prompt(specs: list[LoadedSpec], existing_actors: dict[str, list[str]] | None = None) -> str:
     keys = [e.key for s in specs for e in s.endpoints]
     parts = [f"There are {len(specs)} specifications. Endpoint keys: {keys}", *(digest(s) for s in specs)]
+    if existing_actors:
+        parts.append(f"Existing actors per module (reuse these names): {json.dumps(existing_actors)}")
     return "\n\n".join(parts)
 
 
-async def analyze(specs: list[LoadedSpec], model: Model | None = None) -> SpecAnalysis:
+async def analyze(
+    specs: list[LoadedSpec], model: Model | None = None, existing_actors: dict[str, list[str]] | None = None
+) -> SpecAnalysis:
     keys = {e.key for s in specs for e in s.endpoints}
     result = await run_structured(
         build_agent,
-        build_prompt(specs),
+        build_prompt(specs, existing_actors),
         SpecAnalysis,
         deps=AnalyzerDeps(endpoint_keys=keys),
         model=model or build_model(),

@@ -19,7 +19,7 @@ from typing import Any, Literal
 
 import yaml
 from pydantic import BaseModel, Field
-from pydantic_ai import Agent, RunContext
+from pydantic_ai import Agent, ModelRetry, RunContext
 from pydantic_ai.models import Model
 
 from spec_run_graph.config import get_settings
@@ -63,6 +63,10 @@ class FailedExecution:
     requirement_ids: list[str]
     actor: str | None = None
     similar: list[str] = field(default_factory=list)  # other executions with the same failure signature
+    missing_env: list[str] = field(default_factory=list)  # process.env vars the test uses that are not set
+    undeclared_env: list[str] = field(default_factory=list)  # ... of which no actor/fixture declares (invented)
+    # steps that omit contract-required request fields, expected a 4xx and got a 2xx (the API broke its contract)
+    contract_violations: list[str] = field(default_factory=list)
 
 
 _NORMALIZE = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F-]{27}|\d+")
@@ -73,12 +77,61 @@ def signature(f: FailedExecution) -> tuple:
     first = f.failed_assertions[0] if f.failed_assertions else {}
     what = _NORMALIZE.sub("#", str(first.get("assertion") or first.get("test") or ""))[:120]
     why = _NORMALIZE.sub("#", str(first.get("error") or f.error_message or ""))[:120]
-    scope = ("actor", f.actor) if f.http_status in (401, 403) else ("endpoints", tuple(f.endpoints))
+    # an unexpected 401 across endpoints is usually one credential problem; everything else (incl. 403) is
+    # endpoint-specific - grouping 403s by actor copied one diagnosis onto unrelated cases
+    scope = ("actor", f.actor) if f.http_status == 401 else ("endpoints", tuple(f.endpoints))
     return (f.status, f.http_status, what, why, scope)
+
+
+PLACEHOLDER = re.compile(r"\b(placeholder|tbd|todo|lorem|n/?a|unknown cause)\b", re.IGNORECASE)
+
+
+def diagnosis_problems(d: Diagnosis) -> list[str]:
+    """Reject empty / template answers (seen on a real run: root_cause='placeholder', confidence 0)."""
+    problems = []
+    if len(d.root_cause.strip()) < 25 or PLACEHOLDER.search(d.root_cause):
+        problems.append("root_cause must be a concrete explanation (what failed, where, why)")
+    if len(d.recommended_action.strip()) < 10 or PLACEHOLDER.search(d.recommended_action):
+        problems.append("recommended_action must say who should do what")
+    if d.category != "UNKNOWN" and not d.evidence:
+        problems.append("give concrete evidence (status codes, field values) for the category")
+    return problems
 
 
 def preclassify(f: FailedExecution) -> Diagnosis | None:
     """Obvious environment failures need no LLM call."""
+    if f.undeclared_env:
+        names = ", ".join(f.undeclared_env)
+        return Diagnosis(
+            category="TEST_DEFECT",
+            root_cause=f"The test reads environment variable(s) {names}, which no actor or fixture declares: "
+            "the test invented them for data that only exists at run time (e.g. seeded ids).",
+            evidence=[f"undeclared and unset: {names}", f"HTTP {f.http_status}"],
+            recommended_action="Fix the test case: look the value up in an earlier step and extract it.",
+            suggested_fix=f"Replace {{{{ $env.{f.undeclared_env[0]} }}}} with a value extracted in an earlier step "
+            "(e.g. GET the list endpoint, extract the matching id) and use {{ $extract.<name> }}.",
+            confidence=0.95,
+        )
+    if f.missing_env:
+        names = ", ".join(f.missing_env)
+        return Diagnosis(
+            category="ENV_FAILURE",
+            root_cause=f"The test uses environment variable(s) {names}, which are not set (.env / process env), "
+            "so the request was sent without valid credentials or data.",
+            evidence=[f"missing: {names}", f"HTTP {f.http_status}"],
+            recommended_action=f"Set {names} in .env, or re-analyse the specs so documented test accounts log in "
+            "automatically (srg analyze, then srg plan --from <analysis.json> --refresh-only, then srg build).",
+            confidence=0.97,
+        )
+    if f.contract_violations:
+        return Diagnosis(
+            category="APPLICATION_BUG",
+            root_cause="The API accepted a request that omits fields its OpenAPI contract marks as required: "
+            + "; ".join(f.contract_violations),
+            evidence=f.contract_violations[:5],
+            recommended_action="Report to the API team: required-field validation is missing. Keep the test.",
+            confidence=0.9,
+        )
     text = " ".join([f.error_message or ""] + [str(a.get("error") or "") for a in f.failed_assertions])
     if ENV_PATTERNS.search(text):
         return Diagnosis(
@@ -160,6 +213,13 @@ def build_agent(output: Any = None) -> Agent[DiagDeps, Diagnosis]:
         retries=get_settings().srg_llm_retries,
         name="failure-diagnostics",
     )
+
+    @agent.output_validator
+    def check(ctx: RunContext[DiagDeps], out: Diagnosis) -> Diagnosis:
+        problems = diagnosis_problems(out)
+        if problems:
+            raise ModelRetry("Your diagnosis is not usable: " + "; ".join(problems) + ". Investigate and answer again.")
+        return out
 
     @agent.tool
     async def http_exchange(ctx: RunContext[DiagDeps]) -> str:

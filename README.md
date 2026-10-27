@@ -4,12 +4,13 @@ SpecRunGraph turns API specifications (OpenAPI + Markdown PRDs) into executed AP
 
 ```
 srg analyze  ->  srg plan  ->  srg build  ->  srg test  ->  diagnose  ->  heal
- joint LLM        test cases    LLM writes      bru run;     why did it    repair TEST_DEFECT
- analysis         -> Gel        Bruno files     results ->   fail? (API,   cases, rebuild,
-                                                Gel/MinIO    spec, test)   verify or roll back
+ joint LLM        recipes +     compiler        bru run;     why did it    repair TEST_DEFECT
+ analysis         test cases    writes Bruno    results ->   fail? (API,   cases, rebuild,
+                  -> Gel        files           Gel/MinIO    spec, test)   verify or roll back -> lessons
 ```
 
-Every LLM step (analysis, test design, Bruno implementation, chatbot) uses the one model configured in `.env`.
+Every LLM step (analysis, recipes, test design, healing, lessons, chatbot) uses the one model configured in `.env`.
+Bruno files are written by a deterministic compiler; the LLM only implements cases the compiler cannot translate.
 See [architecture.md](architecture.md) for the design.
 
 ## Setup
@@ -48,11 +49,12 @@ Each command ends with an LLM usage line (calls, tokens, call time vs wall time)
 | `srg analyze <specs>` | joint analysis → `reports/analysis/<id>.{json,md}` (no Gel writes) |
 | `srg plan <specs>` / `--from <analysis.json>` | test cases → Gel only (adds only missing coverage; `--replace` starts over) |
 | `srg cases`, `srg show <id> [--approve\|--deprecate]` | review the cases in Gel |
-| `srg build [--id] [--tags] [--force]` | the LLM writes the Bruno files → `test_generated/bruno/` |
+| `srg build [--id] [--tags] [--force]` | compiles the Bruno files → `test_generated/bruno/` (LLM fallback) |
 | `srg test [--heal] [--no-diagnose]` | run with bru, then analyse failures (and heal test defects) |
 | `srg diagnose [RUN_ID]` | analyse the failures of a run |
 | `srg heal [RUN_ID]` | repair `TEST_DEFECT` cases, rebuild, verify or roll back |
 | `srg go <specs>` | analyze → plan → build → test → diagnose |
+| `srg recipes`, `srg lessons` | setup recipes offered to the planner; lessons learned from verified heals |
 | `srg web` | dashboard + QA chatbot on http://127.0.0.1:8090 |
 | `srg reset` | wipe Gel data and the S3 bucket |
 
@@ -66,7 +68,8 @@ uv run srg analyze api/swagger.yaml docs/prd.md        # individual files
 ```
 
 - **API contracts:** OpenAPI 3.x (`openapi:`) or Swagger 2.0 (`swagger: "2.0"`) as `.yaml`, `.yml` or `.json`. Only local `$ref`s (`#/...`) are resolved, so bundle multi-file specs first. For Swagger 2.0 the `basePath` becomes part of each endpoint path.
-- **PRDs:** every `.md` file. Put requirement ids in headings (`## PRD-ORD-42 Create draft order`), name credential env vars (`CUSTOMER_TOKEN`) and test data; set the values in `.env`.
+- **PRDs:** every `.md` file. Put requirement ids in headings (`## PRD-ORD-42 Create draft order`) and describe test data.
+- **Credentials come from the spec.** When the documents describe a login endpoint and test accounts (e.g. `POST /api/admin/login` with `admin` / `admin123`), the analyzer creates *login actors*. The generated collection logs each actor in once per run and uses the returned token (`{{auth_admin}}`), so no tokens go in `.env`. Only when no accounts are documented are actors given `{{ $env.X }}` secrets instead.
 - Other YAML/JSON files in a folder are skipped with a warning; keep unrelated Markdown out of the spec folder.
 - Set `SUT_BASE_URL` in `.env` to the API under test.
 
@@ -87,8 +90,8 @@ uv run srg web                                          # dashboard + chatbot on
 - To narrow a command, use `--id 'TC-ORD-*'` or `--tags smoke` on `build` and `test`.
 - `srg plan` run again only adds cases for coverage that is still missing.
 - If a spec changes (try `examples/orders_v2/`), the cases it affects become `NEEDS_REVIEW`.
-- You can run the generated collection with Bruno directly:
-  `cd test_generated/bruno && CUSTOMER_TOKEN=customer-token bru run orders --env local`.
+- You can run the generated collection with Bruno directly: `cd test_generated/bruno && bru run orders --env local`.
+- After a re-analysis that changed actors or fixtures, run `srg plan --from <analysis.json> --refresh-only` (updates Gel, no new cases) and then `srg build`.
 ## Failure analysis
 
 `srg test` analyses every failed test automatically. To re-analyse a run: `srg diagnose [RUN_ID]`.
@@ -136,6 +139,26 @@ uv run srg heal [RUN_ID]      # heal the TEST_DEFECT failures of an already diag
 
 Options: `--no-verify` applies heals without re-running them (status `UNVERIFIED`), and `--max-cases N` caps the number of cases (default 20).
 
+## Fewer broken test cases
+
+Most generated defects came from the LLM guessing contract details. Four mechanisms remove the guessing:
+
+- **Contract facts.** At ingest every endpoint gets `required_body_fields` and `assertable_paths` (fields the
+  contract guarantees per status), stored on `ApiEndpoint` in Gel. Prompts list them literally ("a successful
+  request MUST send: balance, password, role, username"; "assertable (guaranteed) fields: ..."), the planner sees
+  the full contracts of other modules' endpoints used for setup, and the IR validation rejects missing required
+  request fields, optional response fields (`requestId`, `error.details`) and object keys on lists.
+- **Setup recipes.** Once per analysis the LLM designs reusable setups (dedicated customer with a balance,
+  dedicated product, ...). Each recipe is compiled and run once against the API; only `VERIFIED` recipes
+  (`SetupRecipe` in Gel, `srg recipes`) are offered to the planner, which calls them with one step
+  `{type: recipe, recipe: dedicated_customer, inputs: {balance: 5000}, alias: buyer}`. The step is expanded into
+  ordinary steps before validation and storage (outputs become `{{ $extract.buyer_token }}`, cleanup is added).
+- **Deterministic Bruno compiler.** Requests, auth, variables, extracts and checks translate one-to-one
+  (`engines/bruno/compiler.py`); each check becomes a `test()` with a readable message
+  (`expected == "PAID", got "DRAFT"`). `srg build` needs no LLM for these cases and takes seconds.
+- **Lessons.** After verified heals the LLM generalises the fixes into short rules (`Lesson` in Gel,
+  `srg lessons`), which are added to future planner and healer prompts.
+
 ## Cleaning Gel and S3
 
 `srg reset` deletes all data in Gel and all objects in the MinIO bucket in one command:
@@ -149,7 +172,7 @@ It first shows what will be deleted (object counts per Gel type, plus the number
 | Flag | Effect |
 |---|---|
 | `--yes` / `-y` | Skip the confirmation prompt (for scripts) |
-| `--files` | Also delete `test_generated/` and `reports/` |
+| `--files` | Also delete `reports/` (`test_generated/` is always deleted: it is generated from Gel) |
 | `--schema` | Also reset the Gel schema and re-apply it (use this after incompatible schema changes) |
 | `--force-remote` | Allow a reset when `GEL_DSN` or `S3_ENDPOINT_URL` isn't a local host; without it the command refuses |
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 from pathlib import Path
 from typing import Any
@@ -46,11 +47,72 @@ def env_template(text: str) -> str:
     return re.sub(r"\{\{\s*\$env\.([A-Z][A-Z0-9_]*)\s*\}\}", r"{{process.env.\1}}", text)
 
 
+def auth_var(actor: str) -> str:
+    """Runtime variable that holds the bearer token of a login actor: auth_<actor>."""
+    return "auth_" + re.sub(r"\W", "_", actor)
+
+
+def actor_auth(auth: dict[str, Any]) -> dict[str, Any]:
+    """The Bruno auth block for an actor (login actors use the token fetched by the collection script)."""
+    if auth.get("type") == "login":
+        return {"type": "bearer", "token": "{{" + auth_var(auth["_actor"]) + "}}"}
+    return {k: env_template(v) if isinstance(v, str) else v for k, v in auth.items() if not k.startswith("_")}
+
+
+def _js_value(value: Any) -> str:
+    if isinstance(value, str):
+        m = re.fullmatch(r"\{\{\s*\$env\.([A-Z][A-Z0-9_]*)\s*\}\}", value.strip())
+        if m:
+            return f'bru.getProcessEnv("{m.group(1)}")'
+    if isinstance(value, dict):
+        return "{" + ", ".join(f"{json.dumps(k)}: {_js_value(v)}" for k, v in value.items()) + "}"
+    return json.dumps(value)
+
+
+def login_script(modules: list[dict[str, Any]]) -> str | None:
+    """Collection-level before-request script: log every login actor in once per run, cache the token."""
+    logins: dict[str, str] = {}
+    for m in sorted(modules, key=lambda x: x["code"]):
+        for name, auth in sorted(m["actors"].items()):
+            if auth.get("type") != "login" or not auth.get("login_endpoint"):
+                continue
+            method, _, path = auth["login_endpoint"].partition(" ")
+            logins[auth_var(name)] = (
+                f"{{ method: {json.dumps(method.upper())}, path: {json.dumps((m.get('base_path') or '') + path.strip())}, "
+                f"body: {_js_value(auth.get('login_body') or {})}, tokenPath: {json.dumps(auth.get('token_path') or 'token')} }}"
+            )
+    if not logins:
+        return None
+    entries = ",\n".join(f"  {json.dumps(var)}: {spec}" for var, spec in logins.items())
+    return f"""// SpecRunGraph: log every test actor in once per run (accounts from the specification).
+const logins = {{
+{entries}
+}};
+for (const [variable, l] of Object.entries(logins)) {{
+  if (bru.getVar(variable)) continue;
+  try {{
+    const res = await bru.sendRequest({{
+      method: l.method, url: bru.getEnvVar("baseUrl") + l.path,
+      headers: {{ "Content-Type": "application/json" }}, data: l.body,
+    }});
+    const token = l.tokenPath.split(".").reduce((o, k) => (o == null ? o : o[k]), res.data);
+    bru.setVar(variable, token || "LOGIN_FAILED");
+    if (!token) console.error(`[srg] login for ${{variable}} returned no token (HTTP ${{res.status}})`);
+  }} catch (e) {{
+    bru.setVar(variable, "LOGIN_FAILED");
+    console.error(`[srg] login for ${{variable}} failed: ${{e.message}}`);
+  }}
+}}"""
+
+
 def write_scaffold(root: Path, modules: list[dict[str, Any]], base_url: str | None = None) -> list[Path]:
     """modules: module_context() dicts. Returns written paths."""
     root.mkdir(parents=True, exist_ok=True)
     written: list[Path] = []
-    collection = {"opencollection": "1.0.0", "info": {"name": COLLECTION_NAME, "version": "1.0.0"}}
+    collection: dict[str, Any] = {"opencollection": "1.0.0", "info": {"name": COLLECTION_NAME, "version": "1.0.0"}}
+    script = login_script(modules)
+    if script:
+        collection["request"] = {"scripts": [{"type": "before-request", "code": script}]}
     (root / "opencollection.yml").write_text(dump_yaml(collection))
     written.append(root / "opencollection.yml")
 
@@ -62,9 +124,8 @@ def write_scaffold(root: Path, modules: list[dict[str, Any]], base_url: str | No
             variables.append(
                 {
                     "name": fixture_var(m["code"], name),
-                    "value": value
-                    if isinstance(value, str)
-                    else yaml.safe_dump(value, default_flow_style=True).strip(),
+                    # yaml.safe_dump of a scalar appends "\n..." - JSON is exact for numbers, lists and objects
+                    "value": value if isinstance(value, str) else json.dumps(value),
                 }
             )
     env_dir = root / "environments"

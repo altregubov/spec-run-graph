@@ -36,6 +36,7 @@ class PipelineGraphState:
     spec_paths: list[Path] = field(default_factory=list)
     analysis_file: Path | None = None
     replace: bool = False
+    refresh_only: bool = False
     case_filter: CaseFilter = field(default_factory=CaseFilter)
     force: bool = False
     include_needs_review: bool = False
@@ -49,6 +50,7 @@ class PipelineGraphState:
     group_failures: bool = True  # diagnose one representative per failure signature
     heal_verify: bool = True  # rebuild + re-run healed cases; roll back heals that still fail
     max_heal_cases: int = 20
+    heal_lint: bool = False  # heal cases that violate the current rules (not only failed ones)
     # results
     specs: list[LoadedSpec] = field(default_factory=list)
     report: AnalysisReport | None = None
@@ -71,7 +73,7 @@ class HealNode(BaseNode[PipelineGraphState, GraphDependencies, PipelineGraphStat
         s = ctx.state
         run_id = s.diagnose_run_id or (s.run.run_id if s.run else None)
         s.healing = await stages.heal_stage(
-            ctx.deps, run_id, s.case_filter, verify=s.heal_verify, max_cases=s.max_heal_cases
+            ctx.deps, run_id, s.case_filter, verify=s.heal_verify, max_cases=s.max_heal_cases, lint=s.heal_lint
         )
         return End(s)
 
@@ -120,7 +122,7 @@ class PlanNode(BaseNode[PipelineGraphState, GraphDependencies, PipelineGraphStat
         if s.report is None:
             assert s.analysis_file is not None
             s.specs, s.report = stages.load_report(s.analysis_file)
-        s.plan = await stages.plan_stage(ctx.deps, s.specs, s.report, s.replace)
+        s.plan = await stages.plan_stage(ctx.deps, s.specs, s.report, s.replace, s.refresh_only)
         return End(s) if s.stops_after("plan") else BuildNode()
 
 

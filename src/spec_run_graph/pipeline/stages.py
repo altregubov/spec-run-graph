@@ -8,7 +8,9 @@ import asyncio
 import dataclasses
 import hashlib
 import json
+import os
 import re
+import shutil
 import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -22,15 +24,32 @@ from spec_run_graph.agents import analyzer, diagnostics, healer, planner, synthe
 from spec_run_graph.config import dotenv_values
 from spec_run_graph.deps import GraphDependencies
 from spec_run_graph.domain.analysis import AnalysisReport, SpecRef
-from spec_run_graph.domain.ir import REF_RE, CaseDraft, TestCaseIR, ValidationContext, fingerprint, http_steps, ir_hash
-from spec_run_graph.engines.bruno import scaffold
+from spec_run_graph.domain.ir import (
+    REF_RE,
+    CaseDraft,
+    TestCaseIR,
+    ValidationContext,
+    declared_env_vars,
+    fingerprint,
+    http_steps,
+    ir_hash,
+    missing_required,
+    normalize,
+    resolve_endpoint,
+    validate_case,
+)
+from spec_run_graph.engines.bruno import compiler, scaffold
 from spec_run_graph.engines.bruno.naming import FILE_RE, plan_files
+from spec_run_graph.engines.bruno.normalize import normalize_text
 from spec_run_graph.engines.bruno.runner import MANIFEST_NAME, aggregate, run_bru
+from spec_run_graph.engines.bruno.validate import validate_files
 from spec_run_graph.knowledge import repo
 from spec_run_graph.knowledge.repo import CaseFilter
 from spec_run_graph.llm import model_name
+from spec_run_graph.specs.contract import page_limits, required_body_fields
 from spec_run_graph.specs.loader import load_specs
 from spec_run_graph.specs.models import LoadedSpec
+from spec_run_graph.specs.openapi import endpoint_digest
 from spec_run_graph.telemetry.s3 import case_prefix, run_prefix
 
 # ---------------------------------------------------------------- analyze
@@ -45,7 +64,11 @@ async def analyze_stage(deps: GraphDependencies, paths: list[Path]) -> tuple[lis
         f"[bold]Analyzing {len(specs)} specs jointly[/] with [cyan]{model_name()}[/]: "
         + ", ".join(f"{s.name} ({s.spec_type})" for s in specs)
     )
-    analysis = await analyzer.analyze(specs, model=deps.model)
+    try:
+        known_actors = await repo.existing_actors(deps.client)
+    except Exception:  # noqa: BLE001 - Gel down: analysis still works
+        known_actors = {}
+    analysis = await analyzer.analyze(specs, model=deps.model, existing_actors=known_actors)
     prd_reqs: dict[str, dict[str, str]] = {}
     for r in analysis.requirements:
         prd_reqs.setdefault(r.spec, {})[r.req_id] = r.description
@@ -145,11 +168,145 @@ class PlanSummary:
     flagged_for_review: int = 0
     deprecated: int = 0
     failed_chunks: list[tuple[str, list[str], str]] = field(default_factory=list)  # (module, endpoints, error)
+    refreshed: list[str] = field(default_factory=list)  # modules updated by refresh_only
+    recipes: dict[str, str] = field(default_factory=dict)  # recipe name -> status (designed in this run)
+
+
+# ---------------------------------------------------------------- setup recipes
+
+
+def _recipe_module(modules: list[Any]) -> dict[str, Any]:
+    """A synthetic module context with every actor/fixture (recipes are shared by all modules)."""
+    actors: dict[str, Any] = {}
+    fixtures: dict[str, Any] = {}
+    for m in modules:
+        for a in m.actors:
+            actors.setdefault(a.name, a.auth.model_dump(exclude_none=True))
+        for f in m.fixtures:
+            fixtures.setdefault(f.name, {"env": f.env} if f.env else f.value)
+    return {
+        "code": "RCP",
+        "folder": "srg-recipe-check",
+        "domain": "setup recipe check",
+        "base_path": next((m.base_path for m in modules if m.base_path), ""),
+        "default_headers": {},
+        "preconditions": [],
+        "actors": actors,
+        "fixtures": fixtures,
+    }
+
+
+async def verify_recipe(
+    deps: GraphDependencies, recipe: Any, module: dict[str, Any], endpoints: dict[str, Any]
+) -> tuple[bool, str]:
+    """Run the recipe once against the SUT (compiled like any case, in a scratch collection)."""
+    from spec_run_graph.domain.recipes import recipe_as_case
+
+    s = deps.settings
+    case = TestCaseIR.model_validate({**normalize(recipe_as_case(recipe)).model_dump(), "id": "TC-RCP-001"})
+    planned = plan_files(case)
+    try:
+        docs = compiler.compile_case(case, module, planned, endpoints)
+    except compiler.Unsupported as exc:
+        return False, f"cannot compile: {exc}"
+    root = s.reports_dir / "recipes" / recipe.name
+    shutil.rmtree(root, ignore_errors=True)
+    scaffold.write_scaffold(root, [module], s.sut_base_url)
+    folder = root / module["folder"]
+    manifest, files = {}, []
+    for seq, p in enumerate(planned, start=1):
+        docs[p.filename]["info"]["seq"] = seq
+        (folder / p.filename).write_text(scaffold.dump_yaml(docs[p.filename]))
+        rel = f"{module['folder']}/{p.filename}"
+        files.append(rel)
+        manifest[rel] = {"test_id": case.id, "param_index": 0, "step_seq": p.step_seq, "is_cleanup": p.is_cleanup}
+    res = await run_bru(
+        s.bru_bin,
+        root,
+        [module["folder"]],
+        scaffold.ENV_NAME,
+        {"baseUrl": s.sut_base_url},
+        dotenv_values(),
+        root / "out",
+        300,
+    )
+    oc = aggregate(res.results, manifest, {(case.id, 0): files}, res.timed_out)[(case.id, 0)]
+    if oc.status == "PASSED":
+        return True, "passed against " + s.sut_base_url
+    detail = "; ".join(
+        f"{f.get('file', '').rsplit('/', 1)[-1]}: {f.get('assertion') or f.get('test') or ''} -> {f.get('error')}"
+        for f in oc.failed[:5]
+    )
+    return False, f"{oc.status} (HTTP {oc.http_status}) {detail or oc.error_message or ''}"[:2000]
+
+
+async def recipes_stage(
+    deps: GraphDependencies, report: AnalysisReport, endpoints: dict[str, Any], endpoint_paths: dict[str, str]
+) -> dict[str, str]:
+    """Design setup recipes once per analysis and keep those that pass against the SUT."""
+    from spec_run_graph.agents import recipes as recipe_agent
+
+    client = deps.client
+    if not deps.settings.srg_recipes or await repo.recipes_designed_for(client, report.analysis_id):
+        return {}
+    modules = report.analysis.modules
+    module = _recipe_module(modules)
+    ctx = ValidationContext(
+        endpoint_paths=endpoint_paths,
+        actors=set(module["actors"]),
+        fixtures=set(module["fixtures"]),
+        env_vars=declared_env_vars(
+            *[a for m in modules for a in m.actors if a.auth.type != "login"], *[f for m in modules for f in m.fixtures]
+        ),
+        response_schemas={k: e.response_schemas for k, e in endpoints.items()},
+        request_schemas={k: e.request_schema for k, e in endpoints.items()},
+        page_limits=page_limits(endpoints),
+    )
+    schemas = {k: {"request_schema": e.request_schema, "responses": e.response_schemas} for k, e in endpoints.items()}
+    reachable = await health_check(deps.settings.sut_base_url) is None
+    prompt = recipe_agent.build_prompt(
+        report.analysis.summary,
+        module["actors"],
+        module["fixtures"],
+        "\n".join(endpoint_digest(e) for _, e in sorted(endpoints.items())),
+    )
+    result: dict[str, str] = {}
+    feedback = ""
+    for _round in range(2):  # one redesign round for recipes that fail against the API
+        deps.console.print("  designing setup recipes...")
+        try:
+            designed, _ = await recipe_agent.design(prompt + feedback, ctx, model=deps.model)
+        except Exception as exc:  # noqa: BLE001 - recipes are an optimisation; planning works without them
+            deps.console.print(f"  [yellow]recipe design failed[/]: {exc.__class__.__name__}")
+            break
+        failed = []
+        for r in designed:
+            if result.get(r.name) == "VERIFIED":
+                continue
+            ok, detail = (await verify_recipe(deps, r, module, schemas)) if reachable else (False, "SUT unreachable")
+            status = "VERIFIED" if ok else ("FAILED" if reachable else "UNVERIFIED")
+            result[r.name] = status
+            await repo.save_recipe(client, r, status, detail, report.analysis_id, model_name())
+            deps.console.print(f"  recipe [bold]{r.name}[/]: {status} {'' if ok else detail[:160]}")
+            if not ok:
+                failed.append(f"- {r.name}: {detail}")
+        if not failed or not reachable:
+            break
+        feedback = "\n\nThese recipes FAILED when run against the API; fix them (return all recipes):\n" + "\n".join(
+            failed
+        )
+    return result
 
 
 async def plan_stage(
-    deps: GraphDependencies, specs: list[LoadedSpec], report: AnalysisReport, replace: bool = False
+    deps: GraphDependencies,
+    specs: list[LoadedSpec],
+    report: AnalysisReport,
+    replace: bool = False,
+    refresh_only: bool = False,
 ) -> PlanSummary:
+    """Store specs/analysis/modules in Gel and plan new test cases (refresh_only: no new cases, e.g. to
+    update actors/fixtures after a re-analysis)."""
     summary = PlanSummary()
     client = deps.client
     persisted = await repo.persist_specs(client, specs, report)
@@ -165,7 +322,12 @@ async def plan_stage(
             client, m, report.analysis_id, persisted.spec_ids.get(target or ""), persisted.spec_ids.get(prd or "")
         )
 
+    if refresh_only:
+        summary.refreshed = [m.code for m in report.analysis.modules]
+        return summary
     endpoints = {e.key: e for s in specs for e in s.endpoints}
+    summary.recipes = await recipes_stage(deps, report, endpoints, persisted.endpoint_paths)
+    recipes = await repo.load_recipes(client)
     sem = asyncio.Semaphore(deps.settings.srg_llm_concurrency)
 
     chunk_size = max(1, deps.settings.srg_plan_chunk_size)
@@ -181,6 +343,8 @@ async def plan_stage(
                     ctx,
                     existing,
                     model=deps.model,
+                    recipes=recipes,
+                    lessons=lessons,
                 )
             except Exception as exc:  # one bad LLM answer must not lose the other modules
                 summary.failed_chunks.append((m.code, chunk, f"{exc.__class__.__name__}: {str(exc)[:300]}"))
@@ -188,6 +352,8 @@ async def plan_stage(
                 return []
         summary.dropped_invalid += [(m.code, title, errs) for title, errs in dropped]
         return drafts
+
+    lessons = [r.text for r in await repo.lessons(client)]
 
     async def one(m) -> None:
         if replace:
@@ -198,6 +364,10 @@ async def plan_stage(
             requirement_ids=set(persisted.requirement_ids),
             actors={a.name for a in m.actors},
             fixtures={f.name for f in m.fixtures},
+            env_vars=declared_env_vars(*[a for a in m.actors if a.auth.type != "login"], *m.fixtures),
+            response_schemas={k: e.response_schemas for k, e in endpoints.items()},
+            request_schemas={k: e.request_schema for k, e in endpoints.items()},
+            page_limits=page_limits(endpoints),
         )
         shown = [{k: v for k, v in e.items() if k != "fingerprint"} for e in existing]
         chunks = [m.endpoints[i : i + chunk_size] for i in range(0, len(m.endpoints), chunk_size)] or [[]]
@@ -224,8 +394,28 @@ async def plan_stage(
 class BuildSummary:
     generated: list[str] = field(default_factory=list)
     skipped_unchanged: list[str] = field(default_factory=list)
+    revalidated: list[str] = field(default_factory=list)  # unchanged cases regenerated because rules changed
+    normalized: list[str] = field(default_factory=list)  # unchanged cases repaired by the deterministic normalizer
+    compiled: list[str] = field(default_factory=list)  # generated by the deterministic compiler (no LLM)
     failed: list[tuple[str, list[str]]] = field(default_factory=list)
     removed_files: list[str] = field(default_factory=list)
+
+
+def compile_case(
+    case: TestCaseIR, module: dict[str, Any], planned: list[Any], endpoints: dict[str, Any]
+) -> tuple[dict[str, dict] | None, str | None]:
+    """Deterministic compilation, self-checked with the same validator as LLM output.
+    Returns (docs, None) or (None, reason the LLM has to implement the case)."""
+    try:
+        docs = compiler.compile_case(case, module, planned, endpoints)
+    except compiler.Unsupported as exc:
+        return None, f"unsupported by the compiler: {exc}"
+    synthesizer.add_schema_checks(case, planned, docs, endpoints)
+    texts = {name: scaffold.dump_yaml(doc) for name, doc in docs.items()}
+    errors, _ = validate_files(case, module, planned, texts, _secrets_for(module, case))
+    if errors:
+        return None, f"compiled files failed validation: {errors[0][:200]}"
+    return docs, None
 
 
 def _secrets_for(module: dict[str, Any], case: TestCaseIR) -> set[str]:
@@ -307,11 +497,35 @@ async def build_stage(
         module = modules[row.test_module.code]
         folder = root / module["folder"]
         planned = plan_files(case)
-        ihash = ir_hash(case, {"module": module, "model": model})
+        ihash = ir_hash(case, {"module": module, "model": model, "compiler": compiler.COMPILER_VERSION})
         files_exist = all((folder / p.filename).exists() for p in planned)
         if not force and row.ir_hash == ihash and str(row.gen_status) == "GENERATED" and files_exist:
-            summary.skipped_unchanged.append(case.id)
-            return
+            existing = {p.filename: (folder / p.filename).read_text() for p in planned}
+            fixed = {name: normalize_text(text) for name, text in existing.items()}
+            normalized = {name: text for name, (text, _) in fixed.items()}
+            stale, parsed_existing = validate_files(case, module, planned, normalized, _secrets_for(module, case))
+            if not stale:
+                if any(fixes for _, fixes in fixed.values()):  # repaired deterministically, no LLM needed
+                    for name, (text, fixes) in fixed.items():
+                        if fixes:
+                            (folder / name).write_text(text)
+                    summary.normalized.append(case.id)
+                    await repo.record_generation(
+                        client,
+                        case.id,
+                        ok=True,
+                        script_path=f"{module['folder']}/{planned[0].filename}",
+                        script_hash=_content_hash([parsed_existing[p.filename] for p in planned]),
+                        ir_hash=ihash,
+                        attempts=0,
+                        model=row.gen_model or model,
+                        error=None,
+                    )
+                else:
+                    summary.skipped_unchanged.append(case.id)
+                return
+            deps.console.print(f"  {case.id}: files no longer pass validation ({stale[0][:90]}...) - regenerating")
+            summary.revalidated.append(case.id)
         if any(s.poll for s, _ in http_steps(case)):
             err = "unsupported: poll (rendering of polling steps is deferred)"
             summary.failed.append((case.id, [err]))
@@ -328,12 +542,19 @@ async def build_stage(
                     error=err,
                 )
             return
-        endpoints = await repo.endpoint_schemas(client, list(case.coverage.endpoints))
-        async with sem:
-            deps.console.print(f"  implementing [bold]{case.id}[/] ({len(planned)} files)...")
-            parsed, sd = await synthesizer.synthesize(
-                case, module, planned, endpoints, _secrets_for(module, case), model=deps.model
-            )
+        keys = sorted({e.key for e in row.endpoints} | set(case.coverage.endpoints))
+        endpoints = await repo.endpoint_schemas(client, keys)
+        parsed, why = compile_case(case, module, planned, endpoints)
+        gen_model, attempts = f"compiler-v{compiler.COMPILER_VERSION}", 0
+        if parsed is not None:
+            summary.compiled.append(case.id)
+        else:  # features the compiler does not translate: the LLM implements the case
+            async with sem:
+                deps.console.print(f"  implementing [bold]{case.id}[/] with the LLM ({why})...")
+                parsed, sd = await synthesizer.synthesize(
+                    case, module, planned, endpoints, _secrets_for(module, case), model=deps.model
+                )
+            gen_model, attempts = model, sd.attempts
         if parsed is None:
             summary.failed.append((case.id, sd.last_errors))
             if not dry_run:
@@ -374,8 +595,8 @@ async def build_stage(
             script_path=f"{module['folder']}/{planned[0].filename}",
             script_hash=_content_hash(docs),
             ir_hash=ihash,
-            attempts=sd.attempts,
-            model=model,
+            attempts=attempts,
+            model=gen_model,
             error=None,
         )
 
@@ -385,13 +606,18 @@ async def build_stage(
 
     # full build: remove files of cases that are no longer selected (deprecated / needs review / deleted)
     if not flt.narrowed:
-        keep = {r.test_id for r in rows}
+        # a file belongs to a current case only in that case's module folder (ids restart after srg reset)
+        keep = {(modules[r.test_module.code]["folder"], r.test_id) for r in rows}
         for path in root.glob("*/TC-*.yml"):
             m = FILE_RE.match(path.name)
-            if m and m.group(1) not in keep:
+            if m and (path.parent.name, m.group(1)) not in keep:
                 summary.removed_files.append(str(path.relative_to(root)))
                 path.unlink()
                 manifest.pop(str(path.relative_to(root)), None)
+        current_folders = {m["folder"] for m in modules.values()} | {"environments"}
+        for folder in root.iterdir():
+            if folder.is_dir() and folder.name not in current_folders and not any(folder.glob("TC-*.yml")):
+                shutil.rmtree(folder)  # orphaned module folder (only folder.yml left)
     for m in modules.values():
         if (root / m["folder"]).exists():
             renumber_folder(root / m["folder"])
@@ -468,8 +694,10 @@ async def test_stage(
 
     manifest = load_manifest(deps)
     expected: dict[tuple[str, int], list[str]] = {}
+    case_folder = {r.test_id: r.test_module.folder for r in rows}
     for f, meta in manifest.items():
-        expected.setdefault((meta["test_id"], meta["param_index"]), []).append(f)
+        if f.split("/", 1)[0] == case_folder.get(meta["test_id"]):  # ignore stale files in old folders
+            expected.setdefault((meta["test_id"], meta["param_index"]), []).append(f)
     selected = {r.test_id for r in rows}
     expected = {
         k: sorted(v, key=lambda n: _sort_key(n.rsplit("/", 1)[-1])) for k, v in expected.items() if k[0] in selected
@@ -565,8 +793,37 @@ class DiagnoseSummary:
     not_diagnosed: int = 0  # over the max_llm budget
 
 
+def diagnostics_declared_env(module: dict[str, Any]) -> set[str]:
+    return declared_env_vars(
+        {n: a for n, a in module["actors"].items() if a.get("type") != "login"}, module["fixtures"]
+    )
+
+
 def _failure_label(f: diagnostics.FailedExecution) -> str:
     return f"{f.test_id}{chr(ord('a') + f.param_index)}"
+
+
+_STATUS_MISMATCH = re.compile(r"expected (\d{3}) to equal (\d{3})")
+
+
+def contract_violations(case: TestCaseIR, failure: diagnostics.FailedExecution, drafts: dict[str, Any]) -> list[str]:
+    """Failing steps that omit contract-required request fields, expected a 4xx and got a 2xx."""
+    paths = {k: e.path for k, e in drafts.items()}
+    by_file = {p.filename: p for p in plan_files(case)}
+    steps = http_steps(case)
+    out = []
+    for fa in failure.failed_assertions:
+        m = _STATUS_MISMATCH.search(str(fa.get("error") or ""))
+        p = by_file.get(str(fa.get("file") or "").rsplit("/", 1)[-1])
+        if not m or p is None or not (200 <= int(m.group(1)) < 300 and 400 <= int(m.group(2)) < 500):
+            continue
+        step, _ = steps[p.step_seq - 1]
+        key = resolve_endpoint(step.endpoint or "", paths)
+        if key and drafts[key].request_schema and isinstance(step.request.payload, dict):
+            missing = missing_required(drafts[key].request_schema, step.request.payload)
+            if missing:
+                out.append(f"step {p.step_seq} ({step.name}): {key} without {missing} answered {m.group(1)}")
+    return out
 
 
 def _to_failure(row: Any, run_id: str) -> diagnostics.FailedExecution:
@@ -609,6 +866,7 @@ async def diagnose_stage(
     if run_id is None:
         return summary
     flt = flt or CaseFilter()
+    drafts = await repo.endpoint_drafts(client)
     selected = []
     for row in await repo.failed_executions(client, run_id):
         tc = row.test_case
@@ -658,7 +916,13 @@ async def diagnose_stage(
         tid, pidx = failure.test_id, failure.param_index
         failure.similar = [_failure_label(f) for _, f in members[1:]]
         files = sorted(
-            (f for f, m in manifest.items() if m["test_id"] == tid and m["param_index"] == pidx),
+            (
+                f
+                for f, m in manifest.items()
+                if m["test_id"] == tid
+                and m["param_index"] == pidx
+                and f.split("/", 1)[0] == row.test_case.test_module.folder
+            ),
             key=lambda n: _sort_key(n.rsplit("/", 1)[-1]),
         )
 
@@ -690,6 +954,16 @@ async def diagnose_stage(
             detail = "; ".join(str(f.get("assertion") or f.get("test") or f.get("error")) for f in oc.failed[:5])
             return f"{oc.status} (HTTP {oc.http_status}) {detail or oc.error_message or ''}".strip()
 
+        env = {**os.environ, **dotenv_values()}
+        used: set[str] = set()
+        for f in files:
+            if (root / f).exists():
+                used |= set(re.findall(r"process\.env\.([A-Z][A-Z0-9_]*)", (root / f).read_text()))
+        failure.missing_env = sorted(v for v in used if not env.get(v))
+        module_ctx = await repo.module_context(client, row.test_case.test_module.code)
+        declared = diagnostics_declared_env(module_ctx)
+        failure.undeclared_env = [v for v in failure.missing_env if v not in declared]
+        failure.contract_violations = contract_violations(repo.row_to_ir(row.test_case), failure, drafts)
         diag_deps = diagnostics.DiagDeps(
             failure=failure,
             get_report=get_report,
@@ -746,6 +1020,74 @@ class HealSummary:
     run_id: str | None
     rows: list[HealRow] = field(default_factory=list)
     verify_run_ids: list[str] = field(default_factory=list)
+    lessons: list[str] = field(default_factory=list)  # lessons learned (new or confirmed) from verified heals
+
+
+async def learn_lessons(deps: GraphDependencies, verified: list[dict[str, Any]]) -> list[str]:
+    """Generalise verified heals into lessons for future planning/healing (best effort)."""
+    from spec_run_graph.agents import lessons as lesson_agent
+
+    if not verified:
+        return []
+    client = deps.client
+    existing = [r.text for r in await repo.lessons(client, limit=200)]
+    drafts_ = await repo.endpoint_drafts(client)
+    fixes = [{k: v for k, v in f.items() if k != "heal_id"} for f in verified]
+    try:
+        required = {k: required_body_fields(e.request_schema) for k, e in drafts_.items()}
+        drafts = await lesson_agent.extract(fixes, existing, set(drafts_), model=deps.model, required_fields=required)
+    except Exception as exc:  # noqa: BLE001 - lessons are an optimisation
+        deps.console.print(f"  [yellow]lesson extraction failed[/]: {exc.__class__.__name__}")
+        return []
+    out = []
+    for d in drafts:
+        heal_ids = [verified[i]["heal_id"] for i in d.fixes]
+        if d.confirms:
+            await repo.confirm_lesson(client, d.confirms, heal_ids)
+            out.append(d.confirms)
+        else:
+            await repo.add_lesson(client, d.text, d.endpoints, heal_ids, model_name())
+            out.append(d.text)
+    return out
+
+
+async def lint_findings(deps: GraphDependencies, flt: CaseFilter) -> dict[str, Any]:
+    """Active cases that violate the current IR rules, as heal candidates with a synthetic diagnosis."""
+    from types import SimpleNamespace
+
+    client = deps.client
+    ids = await repo.current_spec_ids(client)
+    modules = {m: await repo.module_context(client, m) for m in await repo.list_modules(client)}
+    drafts = await repo.endpoint_drafts(client)
+    findings: dict[str, Any] = {}
+    for row in await repo.load_cases(client, dataclasses.replace(flt, statuses=["DRAFT", "READY"])):
+        m = modules[row.test_module.code]
+        ctx = ValidationContext(
+            endpoint_paths=ids.endpoint_paths,
+            requirement_ids=set(ids.requirement_ids),
+            actors=set(m["actors"]),
+            fixtures=set(m["fixtures"]),
+            env_vars=diagnostics_declared_env(m),
+            response_schemas={k: e.response_schemas for k, e in drafts.items()},
+            request_schemas={k: e.request_schema for k, e in drafts.items()},
+            page_limits=page_limits(drafts),
+        )
+        errors = validate_case(repo.row_to_ir(row), ctx)
+        if errors:
+            findings[row.test_id] = SimpleNamespace(
+                id=None,
+                param_index=0,
+                http_status=None,
+                failed_assertions=[],
+                run=None,
+                test_case=SimpleNamespace(test_id=row.test_id, tags=row.tags, test_module=row.test_module),
+                diagnosis=SimpleNamespace(
+                    root_cause="The case violates framework rules: " + " | ".join(errors[:8]),
+                    evidence=errors[:8],
+                    suggested_fix=None,
+                ),
+            )
+    return findings
 
 
 def _documented_statuses(schemas: dict[str, Any]) -> dict[str, set[int]]:
@@ -771,26 +1113,34 @@ async def heal_stage(
     verify: bool = True,
     max_cases: int = 20,
     max_attempts: int = 2,
+    lint: bool = False,
 ) -> HealSummary:
     """Repair test cases whose failures were diagnosed as TEST_DEFECT, then rebuild and re-run them.
 
     Verified heals are kept (READY, tag `healed`); heals that still fail after max_attempts are rolled back
     to the previous version (NEEDS_REVIEW). Every attempt is recorded as a HealAttempt with before/after IR."""
     client, store = deps.client, deps.store
-    run_id = run_id or await repo.latest_run_id(client)
-    summary = HealSummary(run_id=run_id)
-    if run_id is None:
-        return summary
     flt = flt or CaseFilter()
     by_case: dict[str, list[Any]] = {}
-    for ex in await repo.heal_candidates(client, run_id):
-        if flt.matches(ex.test_case.test_id, ex.test_case.tags):
-            by_case.setdefault(ex.test_case.test_id, []).append(ex)
-    test_ids = sorted(by_case)[:max_cases]
+    if lint:  # cases that violate the current validation rules (no failing run needed)
+        run_id = "lint"
+        by_case = {t: [f] for t, f in (await lint_findings(deps, flt)).items()}
+        already: set[str] = set()
+    else:
+        run_id = run_id or await repo.latest_run_id(client)
+        if run_id is None:
+            return HealSummary(run_id=None)
+        for ex in await repo.heal_candidates(client, run_id):
+            if flt.matches(ex.test_case.test_id, ex.test_case.tags):
+                by_case.setdefault(ex.test_case.test_id, []).append(ex)
+        already = await repo.verified_heals(client, run_id)  # do not heal the same failure twice
+    summary = HealSummary(run_id=run_id)
+    test_ids = sorted(t for t in by_case if t not in already)[:max_cases]
     if not test_ids:
         return summary
 
     persisted = await repo.current_spec_ids(client)
+    recipes = await repo.load_recipes(client)
     sem = asyncio.Semaphore(deps.settings.srg_llm_concurrency)
     state: dict[str, dict[str, Any]] = {}  # test_id -> before, healed, heal_id, attempts, code, ...
 
@@ -807,9 +1157,21 @@ async def heal_stage(
             requirement_ids=set(persisted.requirement_ids),
             actors=set(module["actors"]),
             fixtures=set(module["fixtures"]),
+            env_vars=declared_env_vars(
+                {n: a for n, a in module["actors"].items() if a.get("type") != "login"}, module["fixtures"]
+            ),
         )
         endpoints = sorted(e.key for e in row.endpoints)
+        st["endpoints"] = endpoints
         schemas = await repo.endpoint_schemas(client, endpoints)
+        drafts = await repo.endpoint_drafts(client)
+        ctx.response_schemas = {k: e.response_schemas for k, e in drafts.items()}
+        ctx.request_schemas = {k: e.request_schema for k, e in drafts.items()}
+        ctx.page_limits = page_limits(drafts)
+        ordered = [drafts[k] for k in endpoints if k in drafts] + [
+            e for k, e in sorted(drafts.items()) if k not in endpoints
+        ]
+        contracts = "\n".join(endpoint_digest(e) for e in ordered)
         failures = by_case[test_id]
         diagnoses = [
             {
@@ -824,19 +1186,28 @@ async def heal_stage(
         ]
         exchanges = []
         for ex in failures[:3]:
+            if ex.run is None:
+                exchanges.append("(lint finding: no failing run; fix the rule violations listed in the diagnosis)")
+                continue
             try:
-                exchanges.append(await store.get_text(case_prefix(run_id, test_id, ex.param_index) + "report.json"))
+                exchanges.append(
+                    await store.get_text(case_prefix(ex.run.run_id, test_id, ex.param_index) + "report.json")
+                )
             except Exception as exc:  # noqa: BLE001
                 exchanges.append(f"(report unavailable: {exc.__class__.__name__})")
         prompt = healer.build_prompt(
             current,
             diagnoses,
             "\n".join(exchanges),
-            schemas,
+            contracts,
             await repo.requirement_texts(client, test_id),
             previous_failure,
+            recipes,
+            [r.text for r in await repo.lessons(client, endpoints)],
         )
-        hdeps = healer.HealDeps(original=current, ctx=ctx, documented_statuses=_documented_statuses(schemas))
+        hdeps = healer.HealDeps(
+            original=current, ctx=ctx, documented_statuses=_documented_statuses(schemas), recipes=recipes
+        )
         st["attempts"] += 1
         try:
             async with sem:
@@ -862,7 +1233,7 @@ async def heal_stage(
                 current.model_dump(mode="json"),
                 current.model_dump(mode="json"),
                 model_name(),
-                str(failures[0].id),
+                str(failures[0].id) if failures[0].id else None,
             )
             st["final"] = HealRow(test_id, "REJECTED", st["attempts"], result.unhealable_reason)
             return False
@@ -878,7 +1249,7 @@ async def heal_stage(
             st["before"].model_dump(mode="json"),
             healed.model_dump(mode="json"),
             model_name(),
-            str(failures[0].id),
+            str(failures[0].id) if failures[0].id else None,
         )
         st["summary"] = result.change_summary
         return True
@@ -946,5 +1317,17 @@ async def heal_stage(
         )
     if rolled:
         await build_stage(deps, CaseFilter(ids=set(rolled)), force=True, include_needs_review=True)
+    if not lint:  # lint heals fix framework-rule violations, which the rules already enforce
+        verified = [
+            {
+                "heal_id": st["heal_id"],
+                "root_cause": by_case[t][0].diagnosis.root_cause,
+                "fix": st["summary"],
+                "endpoints": st.get("endpoints", []),
+            }
+            for t, st in state.items()
+            if st.get("final") and st["final"].status == "VERIFIED"
+        ]
+        summary.lessons = await learn_lessons(deps, verified)
     summary.rows = sorted((st["final"] for st in state.values() if st.get("final")), key=lambda r: r.test_id)
     return summary

@@ -17,10 +17,12 @@ from jsonschema import Draft7Validator
 from spec_run_graph.domain.faker import BRUNO_DYNAMIC
 from spec_run_graph.domain.ir import PARAM_TEMPLATE_RE, TestCaseIR, http_steps
 from spec_run_graph.engines.bruno.naming import PlannedFile, var_prefix
-from spec_run_graph.engines.bruno.scaffold import fixture_var
+from spec_run_graph.engines.bruno.scaffold import auth_var, fixture_var
 
 SCHEMA_PATH = Path(__file__).with_name("opencollection.schema.json")
 TEMPLATE_RE = re.compile(r"\{\{(.*?)\}\}")
+SCHEMA_CHECK_MARKER = "// srg: response schema check"
+FILTER_SEGMENT_RE = re.compile(r"\[\s*[A-Za-z_][A-Za-z0-9_]*\s*=")
 HEADER_KEY_RE = re.compile(r"res\.headers\[\s*['\"]([^'\"]+)['\"]\s*\]")
 IR_SYNTAX_RE = re.compile(r"\{\{\s*\$(faker|fixture|env|extract|param|var)\.")
 STATIC_DYNAMIC = {"guid", "timestamp", "isoTimestamp"} | BRUNO_DYNAMIC
@@ -81,8 +83,30 @@ def check_js_syntax(snippets: list[str]) -> list[str]:
             proc = subprocess.run([node, "--check", str(path)], capture_output=True, text=True, timeout=30)
             if proc.returncode != 0:
                 msg = next((ln for ln in proc.stderr.splitlines() if "Error" in ln), proc.stderr.strip()[:300])
-                errors.append(f"JavaScript syntax error in script #{i + 1}: {msg}")
+                hint = ""
+                if re.search(r"(?<![\"'`])\{\{", code):
+                    hint = (
+                        " - Bruno does NOT interpolate {{...}} inside scripts: read variables with "
+                        'bru.getVar("NAME") / bru.getEnvVar("NAME") instead'
+                    )
+                errors.append(f"JavaScript syntax error in script #{i + 1}: {msg}{hint}")
     return errors
+
+
+ENV_REF_RE = re.compile(r"\{\{\s*\$env\.([A-Z][A-Z0-9_]*)\s*\}\}")
+
+
+def allowed_env_vars(case: TestCaseIR, module: dict[str, Any]) -> set[str]:
+    """Env vars a test may read: those the IR, the (non-login) actors or the fixtures reference explicitly."""
+    text = (
+        case.model_dump_json()
+        + json.dumps({n: a for n, a in module["actors"].items() if a.get("type") != "login"})
+        + json.dumps(module["fixtures"])
+    )
+    names = set(ENV_REF_RE.findall(text)) | set(
+        re.findall(r'"env":\s*"([A-Z][A-Z0-9_]*)"', json.dumps(module["fixtures"]))
+    )
+    return names
 
 
 def validate_files(
@@ -104,7 +128,9 @@ def validate_files(
         errors.append(f"unexpected files (use exactly the planned names): {extra}")
 
     prefix = var_prefix(case.id or "")
+    allowed_env = allowed_env_vars(case, module)
     fixture_vars = {fixture_var(module["code"], n) for n in module["fixtures"]}
+    fixture_vars |= {auth_var(n) for n, a in module["actors"].items() if a.get("type") == "login"}
     steps = http_steps(case)
     js: list[str] = []
     for name, content in files.items():
@@ -140,7 +166,7 @@ def validate_files(
             t = raw.strip()
             ok = (
                 t == "baseUrl"
-                or re.fullmatch(r"process\.env\.[A-Z][A-Z0-9_]*", t)
+                or (t.startswith("process.env.") and t.removeprefix("process.env.") in allowed_env)
                 or t in fixture_vars
                 or (t.startswith(prefix) and re.fullmatch(r"[A-Za-z0-9_]+", t))
                 or (t.startswith("$") and t[1:] in STATIC_DYNAMIC)
@@ -160,6 +186,15 @@ def validate_files(
             if secret and secret in content:
                 errors.append(f"{where}: contains a literal secret value; use {{{{process.env.X}}}}")
         runtime = doc.get("runtime") or {}
+        filter_exprs = [str(a.get("expression", "")) for a in runtime.get("assertions") or [] if isinstance(a, dict)]
+        filter_exprs += [
+            str(((a or {}).get("selector") or {}).get("expression", "")) for a in runtime.get("actions") or []
+        ]
+        if any(FILTER_SEGMENT_RE.search(e) for e in filter_exprs):
+            errors.append(
+                f"{where}: list filters like data[model='X'] are not supported in Bruno assertions/actions; "
+                "implement them in a tests / after-response script with Array.find"
+            )
         for action in runtime.get("actions") or []:
             var = ((action or {}).get("variable") or {}).get("name", "")
             if not var.startswith(prefix):
@@ -175,5 +210,8 @@ def validate_files(
             )
             if status is not None and not has_status:
                 errors.append(f"{where}: needs assertion {{expression: res.status, operator: eq, value: '{status}'}}")
+    llm_js = [code for code in js if not code.lstrip().startswith(SCHEMA_CHECK_MARKER)]
+    if any(re.search(r"require\(\s*['\"]ajv['\"]\s*\)|new\s+Ajv\b", code) for code in llm_js):
+        errors.append("do not write schema validation (ajv) yourself - the framework adds it for validate_schema steps")
     errors += check_js_syntax(js)
     return errors, parsed
