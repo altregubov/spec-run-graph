@@ -18,9 +18,9 @@ from spec_run_graph.domain.ir import REF_RE, TestCaseIR, _merged, http_steps, re
 from spec_run_graph.engines.bruno.naming import PlannedFile, var_prefix
 from spec_run_graph.engines.bruno.normalize import _encode
 from spec_run_graph.engines.bruno.scaffold import actor_auth, fixture_template
-from spec_run_graph.engines.bruno.validate import expected_status_for
+from spec_run_graph.engines.bruno.validate import expected_statuses_for, status_assertion
 
-COMPILER_VERSION = "3"
+COMPILER_VERSION = "4"
 _SEGMENT_RE = re.compile(BODY_SEGMENT)
 _FILTER_RE = re.compile(r"^\[([A-Za-z_][A-Za-z0-9_]*)=(.+)\]$")
 
@@ -271,9 +271,9 @@ def compile_case(
         tests: list[str] = []
         runtime: dict[str, Any] = {}
         if not is_cleanup:
-            status = expected_status_for(case, p.step_seq, p.param_index)
-            if status is not None:
-                runtime["assertions"] = [{"expression": "res.status", "operator": "eq", "value": str(status)}]
+            statuses = expected_statuses_for(case, p.step_seq, p.param_index)
+            if statuses:
+                runtime["assertions"] = [status_assertion(statuses)]
             for a in step.assertions:
                 chk = parse_check(a.check)
                 expected = "undefined" if chk.value is None and chk.op.endswith("exists") else ctx.js_value(chk.value)

@@ -400,3 +400,71 @@ def test_list_filter_on_paginated_endpoint_needs_max_page_size():
     limits = {"GET /api/user/products": ("page_size", 100)}
     assert any("paginated list" in e for e in validate_case(normalize(case({})), ctx(page_limits=limits)))
     assert validate_case(normalize(case({"page_size": 100})), ctx(page_limits=limits)) == []
+
+
+def test_non_validation_negative_step_needs_a_complete_body():
+    def case(payload, status):
+        return CaseDraft(
+            title="t",
+            type="negative",
+            actor="admin",
+            steps=[
+                StepIR(name="s", endpoint="POST /api/admin/users", request={"payload": payload}, expected_status=status)
+            ],
+        )
+
+    errors = validate_case(normalize(case(None, 401)), ctx())
+    assert any("sends no body" in e for e in errors)
+    assert validate_case(normalize(case({}, 401)), ctx()) == []  # deliberate empty object: allowed
+    assert validate_case(normalize(case({"username": "x"}, 400)), ctx()) == []  # body validation test: fine
+
+
+def test_state_change_must_not_use_looked_up_shared_entity():
+    case = CaseDraft(
+        title="t",
+        type="positive",
+        actor="admin",
+        steps=[
+            StepIR(
+                name="pick",
+                endpoint="GET /api/user/products",
+                request={"query": {"page_size": 100}},
+                expected_status=200,
+                extract={"pid": "response.body.data[0].id"},
+            ),
+            StepIR(
+                name="order",
+                endpoint="POST /api/user/orders",
+                request={"payload": {"product_id": "{{ $extract.pid }}", "qty": 1}},
+                expected_status=201,
+            ),
+        ],
+    )
+    assert any("looked up from shared data" in e for e in validate_case(normalize(case), ctx()))
+
+
+def test_status_sets_compile_to_an_in_assertion_and_must_be_documented():
+    def case(status):
+        return CaseDraft(
+            title="t",
+            type="security",
+            actor="admin",
+            steps=[
+                StepIR(
+                    name="order",
+                    endpoint="POST /api/user/orders",
+                    expected_status=status,
+                    request=RequestIR(payload={"product_id": 1}),
+                )
+            ],
+        )
+
+    assert not validate_case(normalize(case("201|400")), ctx())
+    assert any("not documented" in e for e in validate_case(normalize(case("400|403")), ctx()))
+    tc = TestCaseIR.model_validate({**normalize(case("201|400")).model_dump(), "id": "TC-ORD-001"})
+    planned = plan_files(tc)
+    docs = compile_case(tc, MODULE, planned, ENDPOINTS)
+    asserts = docs[planned[0].filename]["runtime"]["assertions"]
+    assert asserts == [{"expression": "res.status", "operator": "in", "value": "[201, 400]"}]
+    errors, _ = validate_files(tc, MODULE, planned, {p.filename: dump_yaml(docs[p.filename]) for p in planned}, set())
+    assert not errors

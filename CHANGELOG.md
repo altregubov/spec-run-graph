@@ -1,5 +1,34 @@
 # Changelog
 
+## Unreleased
+
+Aim: generate working test cases up front, so healing is rarely needed.
+
+### Added
+- **Observed data** (`Observation`, `SRG_OBSERVE`): read-only GET samples of the SUT taken before planning, shown to
+  the planner and the recipe designer as values/format context (never as expected statuses).
+- **Workflow recipes:** the recipe designer reads the requirements and adds composite setups (e.g. a product plus a
+  customer allowed to see and afford it); up to 6 recipes.
+- **Planner rule statistics:** `srg plan` lists the most frequently broken validation rules; the failure analysis
+  prints the share of cases without test defects.
+- IR rules: a step that sends no body although the endpoint has required fields is rejected; a 2xx state change must
+  not use an entity looked up from shared data.
+- **Status sets:** `expected_status: "401|403"` when the specs allow several statuses for one condition (every one
+  must be documented); compiled to the native Bruno assertion `res.status in [401, 403]`.
+
+### Fixed
+- Recipes were unusable in modules without the actor their steps run as (e.g. `admin` creating a customer for a
+  customer-only module): such cases failed validation and the planner fell back to shared catalogue data. Modules now
+  get the actors their recipes need.
+- Observed samples are trimmed to contract-guaranteed fields, so optional ones (`requestId`, `pagination`) do not
+  invite assertions.
+
+### Changed
+- `srg reset` keeps lessons (`--knowledge` deletes them too).
+- Planner prompt: free-text values the API may normalise are compared case-insensitively unless the contract
+  documents the format; undefined behaviour (case sensitivity of enum values, tie order) is not asserted; computed
+  values come from the case's own data.
+
 ## v0.3.0 — 2026-10-27
 
 Fewer broken generated test cases. On the warehouse API, a fresh run went from 103/212 to 142/157 passing,

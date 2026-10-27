@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -29,7 +30,7 @@ variables, parameters, steps, expected_results, cleanup. Do NOT set an id - ids 
 Step fields: name, type (http|delay|recipe), actor (only when the step runs as a different module actor than the
 case, e.g. a "user-role token" step in an admin case), endpoint ("METHOD /openapi/path", path parameters may be filled
 inline with templates, e.g. "GET /v1/orders/{{ $extract.order_id }}", or via request.path_params),
-request {headers, query, path_params, payload}, expected_status (int or "{{ $param.<key> }}"),
+request {headers, query, path_params, payload}, expected_status (int, "401|403" or "{{ $param.<key> }}"),
 validate_schema (true to check the response against the OpenAPI schema), extract {var: path},
 assertions [{check, message}], expected_error {code} (sugar for an error.code check), delay_ms (delay steps only).
 
@@ -69,9 +70,20 @@ Rules:
   may be selected by attribute instead of [0]: data[model='X'].id). Optional fields such as requestId,
   error.details or pagination may be omitted by the API; `not exists` checks are fine.
 - Steps expected to succeed must send every field listed under "a successful request MUST send" - also on
-  setup steps against other modules' endpoints (e.g. role and balance when creating a user).
+  setup steps against other modules' endpoints (e.g. role and balance when creating a user). The same holds for
+  negative steps that test something other than body validation (wrong password -> 401, missing token, unknown
+  id): send a complete body, otherwise the API answers 400 before reaching the tested condition.
+- Orders, stock changes and other state-changing requests use entities the case creates (a recipe such as
+  dedicated_product, or a POST step), never an item picked from the shared catalogue ("cheapest laptop"):
+  other tests leave products with zero stock or price there.
 - Assert only fields that exist in the documented response schema (e.g. error.code/error.message, not
   invented fields); for lists use the documented item fields (e.g. data[0].id, not data[0].product_id).
+- Expected statuses: when the requirements or the contract allow several statuses for the same condition
+  ("401 or 403", "rejected with 400 or 422"), set expected_status to all of them, e.g. "401|403" (each must be
+  documented for the endpoint). Otherwise use the single documented status.
+- Test only behaviour the specifications define. Do not assert undefined details such as case sensitivity of
+  enum/sort values, whitespace trimming or the order of ties; leave them out instead of guessing.
+- Derive computed values from the case's own data (total_price = unit price x quantity of THIS order).
 - Put teardown of created data into `cleanup` (same step format; failures there are ignored).
 - Authentication only via actors (case `actor` / step `actor`); never literal tokens.
 - {{ $env.X }} is ONLY for the declared environment variables listed in the input - never for test data.
@@ -81,6 +93,11 @@ Rules:
   token -> 401) and, where several actors exist, rbac cases. Prefer few precise cases over many vague ones.
 - Where specifications conflict, follow the OpenAPI contract for expected values, add the tag
   "spec-conflict" and explain the conflict in expected_results.
+- "Observed data" shows real responses of the API (read-only samples taken before planning). Use it to pick
+  existing values (categories, manufacturers, models) and to see how the API formats them (casing, number
+  formats). Free-text values the API may normalise are compared case-insensitively (matches '(?i)^apple$'),
+  unless the contract documents the exact format. Never assert counts, ids or balances from the samples - data
+  changes between runs - and never derive an expected status from them: the contract decides.
 - Use only endpoints listed in the input."""
 
 EXAMPLE = """\
@@ -105,6 +122,22 @@ class PlannerDeps:
     ctx: ValidationContext
     recipes: dict[str, RecipeIR] = field(default_factory=dict)
     dropped: list[tuple[str, list[str]]] = field(default_factory=list)
+    rule_hits: dict[str, int] = field(default_factory=dict)  # validation rule -> times broken (all attempts)
+
+
+_RULE_NOISE = [
+    (re.compile(r"^(cleanup )?step \d+ \([^)]*\):\s*"), ""),
+    (re.compile(r"'[^']*'|\"[^\"]*\"|\{\{[^}]*\}\}"), "<v>"),
+    (re.compile(r"\[[^\]]*\]"), "[..]"),
+    (re.compile(r"\b\d+\b"), "<n>"),
+]
+
+
+def rule_key(error: str) -> str:
+    """A validation error without its case-specific details, to count which rules the LLM struggles with."""
+    for pattern, repl in _RULE_NOISE:
+        error = pattern.sub(repl, error)
+    return error[:100]
 
 
 def build_agent(output: Any = None) -> Agent[PlannerDeps, PlannedCases]:
@@ -126,6 +159,9 @@ def build_agent(output: Any = None) -> Agent[PlannerDeps, PlannedCases]:
             errors = errors or validate_case(normalized, ctx.deps.ctx)
             if errors:
                 problems.append((i, case.title, errors))
+                for e in errors:
+                    key = rule_key(e)
+                    ctx.deps.rule_hits[key] = ctx.deps.rule_hits.get(key, 0) + 1
             else:
                 valid.append(normalized)
         if not out.cases:
@@ -146,6 +182,7 @@ def build_prompt(
     existing: list[dict],
     recipes: dict[str, RecipeIR] | None = None,
     lessons: list[str] | None = None,
+    observed: str = "",
 ) -> str:
     own = [endpoints[k] for k in module.endpoints if k in endpoints]
     others = [endpoints[k] for k in sorted(endpoints) if k not in module.endpoints]
@@ -176,6 +213,11 @@ def build_prompt(
         )
     if lessons:
         parts.append("Lessons learned from earlier test defects (follow them):\n- " + "\n- ".join(lessons))
+    if observed:
+        parts.append(
+            "Observed data (real GET responses, trimmed; values and formats only - the contract decides what is"
+            " correct):\n" + observed
+        )
     if conflicts:
         parts.append("Specification conflicts:\n" + json.dumps([c.model_dump() for c in conflicts]))
     if gaps:
@@ -196,11 +238,13 @@ async def plan_module(
     model: Model | None = None,
     recipes: dict[str, RecipeIR] | None = None,
     lessons: list[str] | None = None,
+    observed: str = "",
+    rule_hits: dict[str, int] | None = None,
 ) -> tuple[list[CaseDraft], list[tuple[str, list[str]]]]:
-    deps = PlannerDeps(ctx=ctx, recipes=recipes or {})
+    deps = PlannerDeps(ctx=ctx, recipes=recipes or {}, rule_hits=rule_hits if rule_hits is not None else {})
     result = await run_structured(
         build_agent,
-        build_prompt(analysis, module, endpoints, existing, recipes, lessons),
+        build_prompt(analysis, module, endpoints, existing, recipes, lessons, observed),
         PlannedCases,
         deps=deps,
         model=model or build_model(),

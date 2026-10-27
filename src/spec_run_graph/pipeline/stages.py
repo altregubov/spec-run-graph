@@ -25,6 +25,7 @@ from spec_run_graph.config import dotenv_values
 from spec_run_graph.deps import GraphDependencies
 from spec_run_graph.domain.analysis import AnalysisReport, SpecRef
 from spec_run_graph.domain.ir import (
+    BODY_ERROR_STATUSES,
     REF_RE,
     CaseDraft,
     TestCaseIR,
@@ -46,7 +47,8 @@ from spec_run_graph.engines.bruno.validate import validate_files
 from spec_run_graph.knowledge import repo
 from spec_run_graph.knowledge.repo import CaseFilter
 from spec_run_graph.llm import model_name
-from spec_run_graph.specs.contract import page_limits, required_body_fields
+from spec_run_graph.pipeline.observe import observation_digest, observe
+from spec_run_graph.specs.contract import page_limits, required_body_fields, response_facts
 from spec_run_graph.specs.loader import load_specs
 from spec_run_graph.specs.models import LoadedSpec
 from spec_run_graph.specs.openapi import endpoint_digest
@@ -170,6 +172,8 @@ class PlanSummary:
     failed_chunks: list[tuple[str, list[str], str]] = field(default_factory=list)  # (module, endpoints, error)
     refreshed: list[str] = field(default_factory=list)  # modules updated by refresh_only
     recipes: dict[str, str] = field(default_factory=dict)  # recipe name -> status (designed in this run)
+    observed: int = 0  # GET samples taken from the SUT before planning
+    rule_hits: dict[str, int] = field(default_factory=dict)  # validation rule -> times the planner broke it
 
 
 # ---------------------------------------------------------------- setup recipes
@@ -240,8 +244,35 @@ async def verify_recipe(
     return False, f"{oc.status} (HTTP {oc.http_status}) {detail or oc.error_message or ''}"[:2000]
 
 
+async def observe_stage(deps: GraphDependencies, report: AnalysisReport, endpoints: dict[str, Any]) -> int:
+    """Store read-only GET samples of the SUT (planner context: real values, casing, formats), trimmed to the
+    fields the contract guarantees so optional ones (requestId, pagination) do not invite assertions."""
+    guaranteed = {
+        k: paths
+        for k, e in endpoints.items()
+        for st, paths in response_facts(e.response_schemas).items()
+        if st == "200"
+    }
+    if not deps.settings.srg_observe or await health_check(deps.settings.sut_base_url) is not None:
+        return 0
+    try:
+        samples = await observe(
+            deps.settings.sut_base_url, report.analysis.modules, {**os.environ, **dotenv_values()}, guaranteed
+        )
+    except Exception as exc:  # noqa: BLE001 - observations are optional context
+        deps.console.print(f"  [yellow]observing the SUT failed[/]: {exc.__class__.__name__}")
+        return 0
+    for smp in samples:
+        await repo.save_observation(deps.client, smp.endpoint, smp.actor, smp.http_status, smp.body)
+    return len(samples)
+
+
 async def recipes_stage(
-    deps: GraphDependencies, report: AnalysisReport, endpoints: dict[str, Any], endpoint_paths: dict[str, str]
+    deps: GraphDependencies,
+    report: AnalysisReport,
+    endpoints: dict[str, Any],
+    endpoint_paths: dict[str, str],
+    observed: str = "",
 ) -> dict[str, str]:
     """Design setup recipes once per analysis and keep those that pass against the SUT."""
     from spec_run_graph.agents import recipes as recipe_agent
@@ -269,6 +300,8 @@ async def recipes_stage(
         module["actors"],
         module["fixtures"],
         "\n".join(endpoint_digest(e) for _, e in sorted(endpoints.items())),
+        requirements=report.analysis.requirements,
+        observed=observed,
     )
     result: dict[str, str] = {}
     feedback = ""
@@ -298,6 +331,23 @@ async def recipes_stage(
     return result
 
 
+def add_recipe_actors(modules: list[Any], recipes: dict[str, Any]) -> list[Any]:
+    """Give every module the actors its recipe steps run as (e.g. admin creating a dedicated customer for a
+    customer-only module); otherwise no recipe would validate there. Returns the changed modules."""
+    defs = {a.name: a for m in modules for a in m.actors}
+    needed = {st.actor for r in recipes.values() for st in [*r.steps, *r.cleanup] if st.actor}
+    changed = []
+    for m in modules:
+        missing = sorted((needed - {a.name for a in m.actors}) & set(defs))
+        if missing:
+            m.actors.extend(
+                defs[n].model_copy(update={"description": f"{defs[n].description} (setup recipes)".strip()})
+                for n in missing
+            )
+            changed.append(m)
+    return changed
+
+
 async def plan_stage(
     deps: GraphDependencies,
     specs: list[LoadedSpec],
@@ -316,18 +366,26 @@ async def plan_stage(
 
     endpoint_owner = {e.key: s.name for s in specs for e in s.endpoints}
     prd = next((s.name for s in specs if s.spec_type == "REQUIREMENTS_DOC"), None)
-    for m in report.analysis.modules:
+
+    async def store_module(m) -> None:
         target = next((endpoint_owner[k] for k in m.endpoints if k in endpoint_owner), None)
         await repo.upsert_module(
             client, m, report.analysis_id, persisted.spec_ids.get(target or ""), persisted.spec_ids.get(prd or "")
         )
 
+    for m in report.analysis.modules:
+        await store_module(m)
+
     if refresh_only:
         summary.refreshed = [m.code for m in report.analysis.modules]
         return summary
     endpoints = {e.key: e for s in specs for e in s.endpoints}
-    summary.recipes = await recipes_stage(deps, report, endpoints, persisted.endpoint_paths)
+    summary.observed = await observe_stage(deps, report, endpoints)
+    observed = observation_digest(await repo.observations(client))
+    summary.recipes = await recipes_stage(deps, report, endpoints, persisted.endpoint_paths, observed)
     recipes = await repo.load_recipes(client)
+    for m in add_recipe_actors(report.analysis.modules, recipes):
+        await store_module(m)
     sem = asyncio.Semaphore(deps.settings.srg_llm_concurrency)
 
     chunk_size = max(1, deps.settings.srg_plan_chunk_size)
@@ -345,6 +403,8 @@ async def plan_stage(
                     model=deps.model,
                     recipes=recipes,
                     lessons=lessons,
+                    observed=observed,
+                    rule_hits=summary.rule_hits,
                 )
             except Exception as exc:  # one bad LLM answer must not lose the other modules
                 summary.failed_chunks.append((m.code, chunk, f"{exc.__class__.__name__}: {str(exc)[:300]}"))
@@ -815,7 +875,7 @@ def contract_violations(case: TestCaseIR, failure: diagnostics.FailedExecution, 
     for fa in failure.failed_assertions:
         m = _STATUS_MISMATCH.search(str(fa.get("error") or ""))
         p = by_file.get(str(fa.get("file") or "").rsplit("/", 1)[-1])
-        if not m or p is None or not (200 <= int(m.group(1)) < 300 and 400 <= int(m.group(2)) < 500):
+        if not m or p is None or not (200 <= int(m.group(1)) < 300 and int(m.group(2)) in BODY_ERROR_STATUSES):
             continue
         step, _ = steps[p.step_seq - 1]
         key = resolve_endpoint(step.endpoint or "", paths)

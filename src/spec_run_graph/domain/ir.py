@@ -31,6 +31,7 @@ SLUG_RE = re.compile(r"^[a-z0-9]+(-[a-z0-9]+)*$")
 IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 FILTER_IN_PATH = re.compile(r"\[[A-Za-z_][A-Za-z0-9_]*=")
 PARAM_TEMPLATE_RE = re.compile(r"^\{\{\s*\$param\.([A-Za-z0-9_]+)\s*\}\}$")
+STATUS_SET_RE = re.compile(r"^\d{3}(\s*\|\s*\d{3})+$")
 NAMESPACES = {"faker", "fixture", "env", "extract", "param", "var"}
 
 
@@ -65,7 +66,9 @@ class StepIR(BaseModel):
     endpoint: str | None = Field(None, description="'METHOD /openapi/path', path segments may be templates")
     actor: str | None = Field(None, description="module actor for this step when it differs from the case actor")
     request: RequestIR = Field(default_factory=RequestIR)
-    expected_status: int | str | None = Field(None, description="int, or '{{ $param.<key> }}'")
+    expected_status: int | str | None = Field(
+        None, description="int, '401|403' (any of these, when the specs allow several), or '{{ $param.<key> }}'"
+    )
     validate_schema: bool = False
     extract: dict[str, str] = Field(default_factory=dict, description="var -> response.body.<path>")
     assertions: list[AssertionIR] = Field(default_factory=list)
@@ -181,6 +184,8 @@ class ValidationContext:
 def missing_required(schema: Any, payload: Any, where: str = "payload") -> list[str]:
     """Required request-body fields absent from a literal payload (nested objects included)."""
     node = _merged(schema)
+    if payload is None:
+        payload = {}  # no body at all: every required field is missing
     if node is None or not isinstance(payload, dict):
         return []
     missing = [f"{where}.{k}" for k in node.get("required", []) if k not in payload]
@@ -368,6 +373,7 @@ def validate_case(case: CaseDraft, ctx: ValidationContext) -> list[str]:
 
     extracted: set[str] = set()
     created: set[str] = set()  # extract vars that hold ids of entities created by this case (non-login POST)
+    looked_up: set[str] = set()  # extract vars read from shared lists/entities (GET)
     resolved: list[str] = []
     for idx, (step, is_cleanup) in enumerate(http_steps(case), start=1):
         where = f"{'cleanup' if is_cleanup else 'step'} {idx} ({step.name})"
@@ -409,8 +415,17 @@ def validate_case(case: CaseDraft, ctx: ValidationContext) -> list[str]:
                 errors.append(f"{where}: expected_status {es} is not an HTTP status")
         else:
             m = PARAM_TEMPLATE_RE.match(es.strip())
-            if not (es.strip().isdigit() or (m and m.group(1) in param_keys)):
-                errors.append(f"{where}: expected_status must be an int or '{{{{ $param.<key> }}}}'")
+            if not (es.strip().isdigit() or STATUS_SET_RE.match(es.strip()) or (m and m.group(1) in param_keys)):
+                errors.append(f"{where}: expected_status must be an int, '401|403' or '{{{{ $param.<key> }}}}'")
+            rows = [str(r.get(m.group(1), "")) for r in case.parameters] if m else [es]
+            sets = [parse_statuses(v) for v in rows if STATUS_SET_RE.match(v.strip())]
+            documented = (ctx.response_schemas or {}).get(key or "") if ctx.response_schemas is not None else None
+            for alternatives in sets if documented else []:
+                if undocumented := sorted(st for st in alternatives if str(st) not in documented):
+                    errors.append(
+                        f"{where}: a status set may only list documented statuses; {undocumented} are not "
+                        f"documented for {key}"
+                    )
         for a in step.assertions:
             try:
                 parse_check(a.check)
@@ -422,14 +437,31 @@ def validate_case(case: CaseDraft, ctx: ValidationContext) -> list[str]:
                 errors.append(f"{where}: extract name {var!r} must be an identifier")
             if not PATH_RE.match(path):
                 errors.append(f"{where}: extract path {path!r} must be response.body.<path> or response.headers.<h>")
-        creates = any(200 <= s < 300 for s in _step_statuses(step, case.parameters))
-        if creates and ctx.request_schemas is not None and key and ctx.request_schemas.get(key):
+        statuses = step_statuses(step, case.parameters)
+        creates = any(200 <= s < 300 for s in statuses)
+        body_valid = statuses and not is_cleanup and not any(s in BODY_ERROR_STATUSES for s in statuses)
+        if body_valid and ctx.request_schemas is not None and key and ctx.request_schemas.get(key):
             missing = missing_required(ctx.request_schemas[key], step.request.payload)
-            if missing:
+            if missing and creates:
                 errors.append(
                     f"{where}: the request is expected to succeed but misses fields the contract requires: "
                     f"{missing} - send them (with valid values)"
                 )
+            elif missing and step.request.payload is None:  # a partial body may be deliberate ({} -> 401)
+                errors.append(
+                    f"{where}: expects {statuses[0]} but sends no body, while the contract requires {missing}. The "
+                    "API rejects an absent body with 400 before reaching the condition under test - send a complete, "
+                    "valid body (e.g. wrong password -> real username/password fields)"
+                )
+        if creates and method in ("POST", "PUT", "PATCH") and "login" not in step.endpoint.lower():
+            for field_name, var in _id_references(step.request.payload):
+                if var in looked_up and var not in created:
+                    errors.append(
+                        f"{where}: {field_name}={{{{ $extract.{var} }}}} is an entity looked up from shared data; "
+                        "other tests drain and change it (stock, price, balance). Use an entity this case creates: "
+                        "a listed recipe that prepares it (a composite one when the actor must also be allowed to "
+                        "see/buy it) or POST it in an earlier step"
+                    )
         if method == "POST" and creates and "login" not in step.endpoint.lower():
             for field_name, value in _unique_literals(step.request.payload):
                 errors.append(
@@ -438,7 +470,7 @@ def validate_case(case: CaseDraft, ctx: ValidationContext) -> list[str]:
                     "variables: {name: 'qa_{{ $faker.uuid }}'} and {{ $var.name }}"
                 )
         if ctx.response_schemas is not None and key and key in ctx.response_schemas:
-            statuses = [str(s) for s in _step_statuses(step, case.parameters)]
+            statuses = [str(s) for s in step_statuses(step, case.parameters)]
             schemas = [(ctx.response_schemas[key].get(s) or {}).get("schema") for s in statuses]
             schemas = [sc for sc in schemas if sc]
             paths = list(step.extract.values())
@@ -474,6 +506,8 @@ def validate_case(case: CaseDraft, ctx: ValidationContext) -> list[str]:
             )
         if method == "POST" and "login" not in step.endpoint.lower():
             created |= set(step.extract)
+        if method == "GET":
+            looked_up |= set(step.extract)
         extracted |= set(step.extract)
         if step.validate_schema and key is None:
             errors.append(f"{where}: validate_schema needs a resolvable endpoint")
@@ -487,10 +521,28 @@ def validate_case(case: CaseDraft, ctx: ValidationContext) -> list[str]:
 
 def creates_or_cleanup(step: StepIR, is_cleanup: bool, parameters: list[dict[str, Any]]) -> bool:
     """Only steps that are expected to succeed actually modify data (negative tests may target anything)."""
-    return is_cleanup or any(200 <= s < 300 for s in _step_statuses(step, parameters))
+    return is_cleanup or any(200 <= s < 300 for s in step_statuses(step, parameters))
 
 
 UNIQUE_FIELDS = {"username", "email", "login", "user_name"}
+BODY_ERROR_STATUSES = {400, 413, 415, 422}  # statuses a test may provoke with an incomplete/invalid body
+_EXTRACT_ONLY_RE = re.compile(r"^\{\{\s*\$extract\.([A-Za-z0-9_]+)\s*\}\}$")
+
+
+def _id_references(payload: Any) -> list[tuple[str, str]]:
+    """(field, extract var) for id fields whose value is exactly one {{ $extract.x }} template."""
+    found: list[tuple[str, str]] = []
+    if isinstance(payload, dict):
+        for k, v in payload.items():
+            m = _EXTRACT_ONLY_RE.match(v.strip()) if isinstance(v, str) else None
+            if m and (k == "id" or k.lower().endswith("_id")):
+                found.append((k, m.group(1)))
+            elif isinstance(v, dict | list):
+                found.extend(_id_references(v))
+    elif isinstance(payload, list):
+        for v in payload:
+            found.extend(_id_references(v))
+    return found
 
 
 def _unique_literals(payload: Any) -> list[tuple[str, str]]:
@@ -507,16 +559,25 @@ def _unique_literals(payload: Any) -> list[tuple[str, str]]:
     return found
 
 
-def _step_statuses(step: StepIR, parameters: list[dict[str, Any]]) -> list[int]:
+def parse_statuses(value: Any) -> list[int]:
+    """401 / '401' / '401|403' -> [401] / [401] / [401, 403]; anything else -> []."""
+    if isinstance(value, int):
+        return [value]
+    text = str(value).strip()
+    if text.isdigit() or STATUS_SET_RE.match(text):
+        return [int(v) for v in text.split("|")]
+    return []
+
+
+def step_statuses(step: StepIR, parameters: list[dict[str, Any]]) -> list[int]:
+    """Every status the step may expect (all parameter rows, all alternatives)."""
     es = step.expected_status
     if es is None:
         return []
-    if isinstance(es, int) or str(es).strip().isdigit():
-        return [int(es)]
     m = PARAM_TEMPLATE_RE.match(str(es).strip())
     if m:
-        return [int(r[m.group(1)]) for r in parameters if str(r.get(m.group(1), "")).isdigit()]
-    return []
+        return [st for r in parameters for st in parse_statuses(r.get(m.group(1), ""))]
+    return parse_statuses(es)
 
 
 def normalize(case: CaseDraft) -> CaseDraft:

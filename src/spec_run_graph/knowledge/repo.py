@@ -1048,6 +1048,34 @@ async def verified_heals(client: Client, run_id: str) -> set[str]:
     )
 
 
+# ---------------------------------------------------------------- observations
+
+
+async def save_observation(client: Client, endpoint: str, actor: str, http_status: int, sample: Any) -> None:
+    await client.query(
+        """
+        insert Observation {
+            endpoint := <str>$endpoint, actor := <str>$actor, http_status := <int32>$status, sample := <json>$sample
+        } unless conflict on (.endpoint, .actor) else (
+            update Observation set {
+                http_status := <int32>$status, sample := <json>$sample, updated_at := datetime_current()
+            }
+        )
+        """,
+        endpoint=endpoint,
+        actor=actor,
+        status=http_status,
+        sample=to_json(sample),
+    )
+
+
+async def observations(client: Client) -> list[Any]:
+    rows = await client.query(
+        "select Observation { endpoint, actor, http_status, sample, updated_at } order by .endpoint"
+    )
+    return list(rows)
+
+
 # ---------------------------------------------------------------- setup recipes
 
 

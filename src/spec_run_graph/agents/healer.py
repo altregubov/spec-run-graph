@@ -21,7 +21,7 @@ from pydantic_ai.models import Model
 
 from spec_run_graph.config import get_settings
 from spec_run_graph.domain.ir import (
-    PARAM_TEMPLATE_RE,
+    BODY_ERROR_STATUSES,
     CaseDraft,
     ValidationContext,
     covered_endpoints,
@@ -29,6 +29,7 @@ from spec_run_graph.domain.ir import (
     missing_required,
     normalize,
     resolve_endpoint,
+    step_statuses,
     validate_case,
 )
 from spec_run_graph.domain.recipes import RecipeIR, expand_recipes, recipe_brief
@@ -55,7 +56,9 @@ Rules:
   extract the token and use header Authorization: Bearer {{ $extract.token }} - shared seed accounts get drained.
 - Assert/extract only the paths listed as "assertable (guaranteed) fields" (optional ones such as requestId,
   error.details or pagination may be omitted by the API); `not exists` checks are fine.
-- Requests expected to succeed must send every field listed under "a successful request MUST send".
+- Requests expected to succeed must send every field listed under "a successful request MUST send"; so must
+  negative steps that test something other than body validation (e.g. wrong password -> 401).
+- State-changing requests (orders, stock) use entities the case creates, not items picked from shared lists.
 - Never assume a pristine database (balances, stock, counts, list order change during the suite): extract a
   baseline first and compare relative to it; select list items by attribute: response.body.data[model='X'].id.
 - Check grammar: "<path> <op> <literal>", paths response.status | response.headers.<h> | response.body.<path>,
@@ -85,15 +88,7 @@ class HealDeps:
 
 def _expected_statuses(case: CaseDraft, step_index: int) -> list[int]:
     step, _ = http_steps(case)[step_index]
-    es = step.expected_status
-    if es is None:
-        return []
-    if isinstance(es, int) or str(es).strip().isdigit():
-        return [int(es)]
-    m = PARAM_TEMPLATE_RE.match(str(es).strip())
-    if m:
-        return [int(row[m.group(1)]) for row in case.parameters if str(row.get(m.group(1), "")).isdigit()]
-    return []
+    return step_statuses(step, case.parameters)
 
 
 def _required_field_negatives(case: CaseDraft, ctx: ValidationContext) -> set[tuple[str, frozenset[str]]]:
@@ -105,7 +100,7 @@ def _required_field_negatives(case: CaseDraft, ctx: ValidationContext) -> set[tu
         key = resolve_endpoint(step.endpoint, ctx.endpoint_paths)
         schema = ctx.request_schemas.get(key or "")
         statuses = _expected_statuses(case, i)
-        if schema and statuses and all(400 <= s < 500 for s in statuses):
+        if schema and statuses and all(s in BODY_ERROR_STATUSES for s in statuses):
             missing = missing_required(schema, step.request.payload)
             if missing:
                 out.add((key, frozenset(missing)))

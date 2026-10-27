@@ -24,8 +24,16 @@ step sequence that test cases call instead of re-inventing their setup, e.g.
 - dedicated_customer: create a fresh user account with a given balance (admin API), log in as it,
   outputs: user_id, token (send as header Authorization: Bearer {{ $extract.token }}), username;
 - dedicated_product: create a product with a given stock and price, outputs: product_id, model.
-Propose 2-5 recipes for the setups that many tests need (dedicated accounts with a known balance, entities
+Propose 2-6 recipes for the setups that many tests need (dedicated accounts with a known balance, entities
 whose state tests change). Do not write tests: recipes only prepare data and capture outputs.
+
+Read the requirements: for every workflow that needs several prepared entities which must fit together, add
+one COMPOSITE recipe that prepares all of them in a single call, so tests never fall back to shared seed data.
+Example: if customers can only see or buy products matching their allowed categories/manufacturers, a
+purchasable_product_for_customer recipe creates a product (stock, price, category, manufacturer), creates a
+customer whose balance covers it and whose filters allow it, logs in as that customer, and outputs
+product_id, unit price, user_id and token. Inputs let tests vary the important values (stock, price, balance).
+Use the observed data to pick values that exist in this API (category/manufacturer names and their casing).
 
 Recipe fields: name (snake_case), description (what it sets up, what each output holds),
 inputs {name: {description, default}} (EVERY input needs a sensible default; use them as {{ $input.name }}),
@@ -44,7 +52,7 @@ Rules:
 
 
 class RecipeSet(BaseModel):
-    recipes: list[RecipeIR] = Field(description="2-5 reusable setup recipes")
+    recipes: list[RecipeIR] = Field(description="2-6 reusable setup recipes")
 
 
 @dataclass
@@ -103,15 +111,29 @@ def build_agent(output: Any = None) -> Agent[RecipeDeps, RecipeSet]:
     return agent
 
 
-def build_prompt(summary: str, actors: dict[str, Any], fixtures: dict[str, Any], contracts: str) -> str:
-    return "\n\n".join(
-        [
-            f"Product summary:\n{summary}",
-            f"Actors (authentication is automatic for these names): {json.dumps(actors)}",
-            f"Fixtures: {json.dumps(fixtures, default=str)}",
-            "OpenAPI contracts:\n" + contracts,
+def build_prompt(
+    summary: str,
+    actors: dict[str, Any],
+    fixtures: dict[str, Any],
+    contracts: str,
+    requirements: list[Any] | None = None,
+    observed: str = "",
+) -> str:
+    parts = [
+        f"Product summary:\n{summary}",
+        f"Actors (authentication is automatic for these names): {json.dumps(actors)}",
+        f"Fixtures: {json.dumps(fixtures, default=str)}",
+        "OpenAPI contracts:\n" + contracts,
+    ]
+    if requirements:
+        brief = [
+            {"id": r.req_id, "title": r.title, "description": r.description, "criteria": r.acceptance_criteria}
+            for r in requirements
         ]
-    )
+        parts.append("Requirements (workflows the tests must cover):\n" + json.dumps(brief))
+    if observed:
+        parts.append("Observed data (real GET responses, trimmed):\n" + observed)
+    return "\n\n".join(parts)
 
 
 async def design(prompt: str, ctx: ValidationContext, model: Model | None = None) -> tuple[list[RecipeIR], RecipeDeps]:

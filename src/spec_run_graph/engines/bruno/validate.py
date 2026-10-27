@@ -15,7 +15,7 @@ import yaml
 from jsonschema import Draft7Validator
 
 from spec_run_graph.domain.faker import BRUNO_DYNAMIC
-from spec_run_graph.domain.ir import PARAM_TEMPLATE_RE, TestCaseIR, http_steps
+from spec_run_graph.domain.ir import PARAM_TEMPLATE_RE, TestCaseIR, http_steps, parse_statuses
 from spec_run_graph.engines.bruno.naming import PlannedFile, var_prefix
 from spec_run_graph.engines.bruno.scaffold import auth_var, fixture_var
 
@@ -50,20 +50,29 @@ def schema_errors(data: Any, defname: str | None) -> list[str]:
     return out
 
 
-def expected_status_for(case: TestCaseIR, step_seq: int, param_index: int) -> int | None:
+def expected_statuses_for(case: TestCaseIR, step_seq: int, param_index: int) -> list[int]:
+    """Statuses a step may answer with for one parameter row (several when the specs allow e.g. 401 or 403)."""
     step, _ = http_steps(case)[step_seq - 1]
     es = step.expected_status
     if es is None:
-        return None
-    if isinstance(es, int):
-        return es
-    if es.strip().isdigit():
-        return int(es)
-    m = PARAM_TEMPLATE_RE.match(es.strip())
-    if m and case.parameters:
-        value = case.parameters[param_index].get(m.group(1))
-        return int(value) if value is not None else None
-    return None
+        return []
+    m = PARAM_TEMPLATE_RE.match(str(es).strip())
+    if m:
+        return parse_statuses(case.parameters[param_index].get(m.group(1), "")) if case.parameters else []
+    return parse_statuses(es)
+
+
+def expected_status_for(case: TestCaseIR, step_seq: int, param_index: int) -> int | None:
+    """The primary expected status (the first alternative)."""
+    statuses = expected_statuses_for(case, step_seq, param_index)
+    return statuses[0] if statuses else None
+
+
+def status_assertion(statuses: list[int]) -> dict[str, str]:
+    """The native Bruno status assertion: eq for one status, in [..] for alternatives."""
+    if len(statuses) == 1:
+        return {"expression": "res.status", "operator": "eq", "value": str(statuses[0])}
+    return {"expression": "res.status", "operator": "in", "value": "[" + ", ".join(map(str, statuses)) + "]"}
 
 
 def _scripts(doc: dict) -> list[str]:
@@ -201,15 +210,18 @@ def validate_files(
                 errors.append(f"{where}: runtime variable {var!r} must start with {prefix}")
         js += _scripts(doc)
         if not p.is_cleanup:
-            status = expected_status_for(case, p.step_seq, p.param_index)
+            statuses = expected_statuses_for(case, p.step_seq, p.param_index)
+            want = status_assertion(statuses) if statuses else None
             asserts = runtime.get("assertions") or []
             has_status = any(
-                a.get("expression") == "res.status" and a.get("operator") == "eq" and str(a.get("value")) == str(status)
+                isinstance(a, dict) and {k: str(a.get(k)) for k in ("expression", "operator", "value")} == want
                 for a in asserts
-                if isinstance(a, dict)
             )
-            if status is not None and not has_status:
-                errors.append(f"{where}: needs assertion {{expression: res.status, operator: eq, value: '{status}'}}")
+            if want and not has_status:
+                errors.append(
+                    f"{where}: needs assertion {{expression: res.status, operator: {want['operator']}, "
+                    f"value: '{want['value']}'}}"
+                )
     llm_js = [code for code in js if not code.lstrip().startswith(SCHEMA_CHECK_MARKER)]
     if any(re.search(r"require\(\s*['\"]ajv['\"]\s*\)|new\s+Ajv\b", code) for code in llm_js):
         errors.append("do not write schema validation (ajv) yourself - the framework adds it for validate_schema steps")

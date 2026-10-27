@@ -239,6 +239,16 @@ module default {
     model_name: str;
   }
 
+  # Read-only GET samples taken from the SUT before planning (how real data looks: values, casing, formats).
+  # Planner context only - the contract, not these samples, decides what a test expects.
+  type Observation extending Timestamped {
+    required endpoint: str;
+    required actor: str;
+    required http_status: int32;
+    required sample: json;               # trimmed response body
+    constraint exclusive on ((.endpoint, .actor));
+  }
+
   # Generic rules learned from verified heals ("the API returns the request id only in x-request-id");
   # fed into planner and healer prompts so the same defect is not generated again.
   type Lesson extending Timestamped {

@@ -17,7 +17,12 @@ from spec_run_graph.domain.ir import TestCaseIR, http_steps, resolve_endpoint
 from spec_run_graph.engines.bruno.naming import PlannedFile, var_prefix
 from spec_run_graph.engines.bruno.normalize import normalize_text
 from spec_run_graph.engines.bruno.scaffold import actor_auth, fixture_template
-from spec_run_graph.engines.bruno.validate import expected_status_for, validate_files
+from spec_run_graph.engines.bruno.validate import (
+    expected_status_for,
+    expected_statuses_for,
+    status_assertion,
+    validate_files,
+)
 from spec_run_graph.llm import build_model, output_spec, run_structured
 
 INSTRUCTIONS = """\
@@ -54,7 +59,8 @@ Translation rules (IR -> Bruno):
   response.headers.x -> res.headers['x']
 - assertions operators: eq neq gt gte lt lte isDefined isUndefined contains matches in.
   String values are quoted inside the value: value: "'DRAFT'"; numbers/booleans are bare: value: "201".
-  ALWAYS assert the expected status first: {expression: res.status, operator: eq, value: "<status>"}.
+  ALWAYS assert the expected status first, exactly as given by the file's status_assertion
+  (e.g. {expression: res.status, operator: eq, value: "201"} or operator in, value "[401, 403]").
 - For checks that are awkward as assertions (in, contains, matches, nested arrays) write a tests script:
   test("<message>", function () { expect(res.getBody().data.status).to.be.oneOf(["A", "B"]); });
 - validate_schema: true -> do NOT write schema validation code (no ajv): the framework appends the OpenAPI
@@ -191,7 +197,9 @@ def build_prompt(
             "implements": f"{'cleanup' if p.is_cleanup else 'step'} #{p.step_seq} '{step.name}'",
             "actor": step.actor or case.actor,
             "auth": actors.get(step.actor or case.actor or ""),
-            "expected_status": None if p.is_cleanup else expected_status_for(case, p.step_seq, p.param_index),
+            "status_assertion": None
+            if p.is_cleanup
+            else status_assertion(expected_statuses_for(case, p.step_seq, p.param_index)),
         }
         if case.parameters:
             entry["parameter_row"] = case.parameters[p.param_index]

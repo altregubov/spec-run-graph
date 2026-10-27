@@ -152,7 +152,7 @@ class _Renderer:
             )
             scripts.append({"type": "before-request", "code": code})
         if not is_cleanup:
-            asserts = [{"expression": "res.status", "operator": "eq", "value": str(entry["expected_status"])}]
+            asserts = [dict(entry["status_assertion"])]
             tests = []
             for a in step.assertions:
                 c = parse_check(self.literal_params(a.check, row))

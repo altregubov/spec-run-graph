@@ -35,6 +35,8 @@ uv run srg doctor             # checks .env, Gel (applies the schema), MinIO, br
 | `SRG_OUTPUT_MODE` | `tool` | `tool`, `native` or `prompted`; falls back to `prompted` automatically if the model can't do tool output |
 | `SRG_PLAN_CHUNK_SIZE` | `3` | endpoints per planner call (smaller = shorter, more reliable answers) |
 | `SRG_LLM_RETRIES`, `SRG_MAX_TOKENS` | `3`, provider default | validation retries per call; output token limit |
+| `SRG_RECIPES` | `true` | design and verify setup recipes before planning |
+| `SRG_OBSERVE` | `true` | take read-only GET samples of the SUT before planning (planner context) |
 | `SUT_BASE_URL`, `SUT_HEALTH_PATH` | `http://localhost:8000`, `/` | the API under test and its pre-flight health check |
 | `GEL_DSN`, `S3_*` | docker compose defaults | Gel and MinIO |
 | any `UPPER_CASE` secret | – | referenced by tests as `{{ $env.NAME }}` (e.g. `ADMIN_TOKEN`), passed to bru as process env, never written to files |
@@ -56,7 +58,7 @@ Each command ends with an LLM usage line (calls, tokens, call time vs wall time)
 | `srg go <specs>` | analyze → plan → build → test → diagnose |
 | `srg recipes`, `srg lessons` | setup recipes offered to the planner; lessons learned from verified heals |
 | `srg web` | dashboard + QA chatbot on http://127.0.0.1:8090 |
-| `srg reset` | wipe Gel data and the S3 bucket |
+| `srg reset` | wipe Gel data and the S3 bucket (lessons are kept; `--knowledge` deletes them) |
 
 ## Providing specs
 
@@ -141,7 +143,8 @@ Options: `--no-verify` applies heals without re-running them (status `UNVERIFIED
 
 ## Fewer broken test cases
 
-Most generated defects came from the LLM guessing contract details. Four mechanisms remove the guessing:
+Most generated defects came from the LLM guessing contract details or real data. These mechanisms remove the
+guessing, so healing stays the exception:
 
 - **Contract facts.** At ingest every endpoint gets `required_body_fields` and `assertable_paths` (fields the
   contract guarantees per status), stored on `ApiEndpoint` in Gel. Prompts list them literally ("a successful
@@ -157,7 +160,23 @@ Most generated defects came from the LLM guessing contract details. Four mechani
   (`engines/bruno/compiler.py`); each check becomes a `test()` with a readable message
   (`expected == "PAID", got "DRAFT"`). `srg build` needs no LLM for these cases and takes seconds.
 - **Lessons.** After verified heals the LLM generalises the fixes into short rules (`Lesson` in Gel,
-  `srg lessons`), which are added to future planner and healer prompts.
+  `srg lessons`), which are added to future planner and healer prompts. They describe the API, not one run, so
+  `srg reset` keeps them (`--knowledge` deletes them too).
+- **Observed data.** Before planning, every GET endpoint without path parameters is called once, read-only, as
+  the first actor of its module (`Observation` in Gel). The samples, trimmed to the fields the contract
+  guarantees, show the planner and the recipe designer which values exist and how the API formats them (e.g.
+  stored casing). They never decide an expected status; the contract does. `SRG_OBSERVE=false` skips this.
+- **Workflow recipes.** The recipe designer reads the requirements and builds composite setups for workflows
+  whose entities must fit together (e.g. a product plus a customer allowed to see and afford it), so order and
+  stock tests never fall back to shared catalogue items. Modules get the actors their recipes run as (e.g.
+  `admin` in a customer-only module).
+- **Allowed status sets.** When the specs allow several statuses for one condition ("401 or 403"), a step expects
+  `"401|403"`, compiled to `res.status in [401, 403]`. Every status in a set must be documented.
+- **Rules against known defect patterns.** The IR validation rejects, among others: a step without body when the
+  endpoint has required fields, a successful order on an entity looked up from shared data, and a list filter on
+  a paginated endpoint without the maximum page size.
+- **Quality metrics.** `srg plan` prints the validation rules the planner broke most often (each one costs a
+  correction round); the failure analysis prints the share of cases without test defects.
 
 ## Cleaning Gel and S3
 
@@ -173,7 +192,8 @@ It first shows what will be deleted (object counts per Gel type, plus the number
 |---|---|
 | `--yes` / `-y` | Skip the confirmation prompt (for scripts) |
 | `--files` | Also delete `reports/` (`test_generated/` is always deleted: it is generated from Gel) |
-| `--schema` | Also reset the Gel schema and re-apply it (use this after incompatible schema changes) |
+| `--knowledge` | Also delete the lessons learned about the API (kept by default) |
+| `--schema` | Also reset the Gel schema and re-apply it (use this after incompatible schema changes; deletes lessons too) |
 | `--force-remote` | Allow a reset when `GEL_DSN` or `S3_ENDPOINT_URL` isn't a local host; without it the command refuses |
 
 A full clean start:

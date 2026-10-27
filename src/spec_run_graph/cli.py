@@ -144,6 +144,8 @@ def print_plan(state: PipelineGraphState) -> None:
         console.print(f"  modules, actors and fixtures updated: {', '.join(p.refreshed)} (no new test cases)")
         console.print("  Next: [bold]srg build[/] regenerates the Bruno files for the changed modules.")
         return
+    if p.observed:
+        console.print(f"  observed {p.observed} read-only GET samples of the SUT (planner context)")
     if p.recipes:
         console.rule("[bold]Setup recipes")
         for name, status in sorted(p.recipes.items()):
@@ -163,6 +165,11 @@ def print_plan(state: PipelineGraphState) -> None:
         console.print("  Re-run the same [bold]srg plan[/] command to fill the missing coverage.")
     if p.deprecated:
         console.print(f"  deprecated {p.deprecated} old cases (--replace)")
+    if p.rule_hits:
+        top = sorted(p.rule_hits.items(), key=lambda kv: -kv[1])[:5]
+        console.print(f"  [dim]planner corrections: {sum(p.rule_hits.values())} rule violations; most frequent:[/]")
+        for rule, n in top:
+            console.print(f"  [dim]  {n:>3}x {rule}[/]")
     console.print("Review with [bold]srg cases[/] / [bold]srg show <id>[/]; implement with [bold]srg build[/].")
 
 
@@ -255,6 +262,13 @@ def print_diagnosis(state: PipelineGraphState, show_empty: bool = False) -> None
     for r in d.rows:
         counts[r.category] = counts.get(r.category, 0) + 1
     console.print("  " + ", ".join(f"[{CATEGORY_COLORS.get(k, 'white')}]{k}[/]={v}" for k, v in sorted(counts.items())))
+    if state.run and state.run.run_id == d.run_id and state.run.outcomes:
+        ran = {o.test_id for o in state.run.outcomes}
+        broken = {r.test_id for r in d.rows if r.category == "TEST_DEFECT"}
+        console.print(
+            f"  generation quality: {len(ran - broken)}/{len(ran)} cases without test defects"
+            f" ({100 * len(ran - broken) / len(ran):.0f}%)"
+        )
     if counts.get("TEST_DEFECT"):
         console.print("  TEST_DEFECT cases were set to NEEDS_REVIEW: fix them, then [bold]srg show <id> --approve[/].")
     for tid, pidx, err in d.errors:
@@ -631,9 +645,13 @@ async def reset(
     yes: Annotated[bool, typer.Option("--yes", "-y", help="do not ask for confirmation")] = False,
     files: Annotated[bool, typer.Option(help="also delete reports/ (test_generated/ is always removed)")] = False,
     schema: Annotated[bool, typer.Option(help="also reset the Gel schema and re-apply migrations")] = False,
+    knowledge: Annotated[
+        bool, typer.Option(help="also forget the lessons learned about the API (kept by default)")
+    ] = False,
     force_remote: bool = False,
 ) -> None:
-    """Delete ALL data in Gel and ALL objects in the S3 bucket (schema and bucket are kept)."""
+    """Delete ALL data in Gel and ALL objects in the S3 bucket (schema and bucket are kept).
+    Lessons learned about the API are kept unless --knowledge (or --schema) is given."""
     from spec_run_graph.telemetry.s3 import TelemetryStore
 
     s = get_settings()
@@ -651,8 +669,11 @@ async def reset(
         raise typer.Exit(2)
     client, store = db.create_client(s), TelemetryStore(s)
     counts = await db.counts(client)
+    keep = () if knowledge or schema else db.KNOWLEDGE
     n_obj, size = await store.stats()
-    console.print("Gel objects: " + ", ".join(f"{k}={v}" for k, v in counts.items() if v))
+    console.print("Gel objects: " + ", ".join(f"{k}={v}" for k, v in counts.items() if v and k not in keep))
+    if kept := {k: counts[k] for k in keep if counts.get(k)}:
+        console.print("Kept: " + ", ".join(f"{k}={v}" for k, v in kept.items()) + " (use --knowledge to delete)")
     console.print(f"S3 s3://{s.s3_bucket}: {n_obj} objects, {size / 1024:.1f} KiB")
     console.print(f"Files: {s.test_generated_dir}/ (generated from Gel)" + (f", {s.reports_dir}/" if files else ""))
     if not yes and not typer.confirm("Delete all of this?"):
@@ -666,7 +687,7 @@ async def reset(
             await db.seed(client)
             console.print("Gel: schema reset and re-applied")
         else:
-            deleted = await db.wipe_all(client)
+            deleted = await db.wipe_all(client, keep=keep)
             console.print("Gel: deleted " + ", ".join(f"{k}={v}" for k, v in deleted.items() if v))
     finally:
         await client.aclose()

@@ -84,7 +84,7 @@ flowchart LR
     D -- "TEST_DEFECT (srg test --heal)" --> H["heal<br/>repair, rebuild, verify<br/>or roll back"]
 ```
 
-`srg go` runs analyze → plan → build → test → diagnose. `srg diagnose` and `srg heal` work on an existing run. `srg cases` / `srg show` review what is in Gel, `srg reset` wipes Gel and the bucket, and `srg web` starts the dashboard.
+`srg plan` first observes the SUT (read-only GETs) and designs/verifies setup recipes (section 5b). `srg go` runs analyze → plan → build → test → diagnose. `srg diagnose` and `srg heal` work on an existing run. `srg cases` / `srg show` review what is in Gel, `srg reset` wipes Gel and the bucket, and `srg web` starts the dashboard.
 
 ---
 
@@ -171,6 +171,10 @@ erDiagram
     TestExecution }o--|| TestCase : "test_case"
 ```
 
+Knowledge used by the planner (not linked to cases): `SetupRecipe` (verified setups, per analysis), `Lesson`
+(rules learned from verified heals, kept across `srg reset`) and `Observation` (read-only GET samples of the SUT,
+unique per endpoint and actor).
+
 ### Type definitions
 - **`SpecType`**: `OPENAPI`, `REQUIREMENTS_DOC`. AsyncAPI, GraphQL and Protobuf come later behind the `SpecLoader` interface.
 - **`TestCaseType`**: `POSITIVE`, `NEGATIVE`, `BOUNDARY`, `SECURITY`, `RBAC`. This is a property of the test case, not of the requirement.
@@ -178,6 +182,8 @@ erDiagram
 - **`GenStatus`** (Bruno implementation): `PENDING`, `GENERATED`, `FAILED_GEN`.
 - **`RunStatus`**: `PENDING`, `RUNNING`, `COMPLETED`, `ABORTED`.
 - **`ExecutionStatus`**: `PASSED`, `FAILED`, `ERROR`, `TIMEOUT`, `SKIPPED`.
+- **`TestStep.expected_status`** (str): a status (`"201"`), a set of allowed statuses (`"401|403"`) or a parameter
+  template (`"{{ $param.expected_status }}"`).
 
 ### Key rules
 - **Coverage is computed:** `TestCase.endpoints := distinct .steps.endpoint`.
@@ -303,7 +309,35 @@ flowchart LR
 - **Compiler first:** `srg build` compiles the IR to Bruno deterministically and self-checks the result with the
   same validator as LLM output; the synthesizer runs only for unsupported features (e.g. `poll`).
 - **Lessons** (`Lesson`): after verified heals, an LLM pass generalises the fixes; lessons that contradict the
-  contract are rejected. They are injected into planner and healer prompts.
+  contract are rejected. They are injected into planner and healer prompts. They describe the API rather than one
+  run, so `srg reset` keeps them (`db.KNOWLEDGE`; `--knowledge` or `--schema` deletes them).
+
+The goal is correct cases at generation time; healing is the exception. Before planning, `plan_stage` therefore:
+
+1. **Observes the SUT** (`pipeline/observe.py`, `Observation`): one read-only GET per endpoint without path
+   parameters, as the first actor of the owning module that can authenticate. Samples are trimmed to the fields
+   the contract guarantees for 200 (so optional `requestId`/`pagination` do not invite assertions) and to 3 list
+   items. The planner and recipe designer see them as value/format context ("observed data"); expected statuses
+   always come from the contract. `SRG_OBSERVE=false` disables it.
+2. **Designs workflow recipes:** the recipe designer gets the requirements and observed data and builds composite
+   setups for workflows whose entities must fit together (a product plus a customer allowed to see and afford it).
+3. **Gives modules their recipe actors** (`add_recipe_actors`): recipe steps often run as `admin`; customer-only
+   modules get that actor, otherwise no recipe would validate there.
+4. **Counts rule violations** per planner call (`planner.rule_key`): `srg plan` prints the most frequent ones, i.e.
+   the rules the prompt explains badly. The failure analysis prints the share of run cases without `TEST_DEFECT`.
+
+IR rules that target the most common generated defects:
+
+| Rule | Prevents |
+| :--- | :--- |
+| Required request fields on 2xx steps, and on any step that sends no body | login without credentials → 400 instead of the tested 401 |
+| No 2xx state change on an entity looked up from shared data | orders against catalogue items other tests drained |
+| Only guaranteed response fields; no object key on a list | asserting optional/invented fields |
+| List filter on a paginated endpoint needs the maximum page size | the item is on page 2 |
+| Status sets (`"401\|403"`) only with documented statuses | pinning one of several allowed statuses; loosening toward a bug |
+
+`expected_status` may be a set of alternatives (`"401|403"`) when the specs allow several statuses; it compiles
+to the native Bruno assertion `res.status in [401, 403]`.
 
 ---
 

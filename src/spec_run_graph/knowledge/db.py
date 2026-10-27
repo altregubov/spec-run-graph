@@ -15,6 +15,7 @@ SCHEMA_FILE = Path(__file__).resolve().parents[3] / "dbschema" / "default.gel"
 # Delete order respects links (children first).
 WIPE_ORDER = [
     "Lesson",
+    "Observation",
     "SetupRecipe",
     "HealAttempt",
     "DiagnosticNote",
@@ -31,6 +32,9 @@ WIPE_ORDER = [
     "FeatureSpec",
     "TestEngine",
 ]
+
+# Knowledge about the API itself (not about one run); `srg reset` keeps it unless asked to forget.
+KNOWLEDGE = ("Lesson",)
 
 BRUNO_ENGINE = {
     "name": "bruno",
@@ -84,12 +88,13 @@ async def counts(client: gel.AsyncIOClient) -> dict[str, int]:
     return {t: await client.query_required_single(f"select count({t})") for t in WIPE_ORDER}
 
 
-async def wipe_all(client: gel.AsyncIOClient) -> dict[str, int]:
-    """Delete every object in one transaction (schema is kept), then re-seed. Returns deleted counts."""
+async def wipe_all(client: gel.AsyncIOClient, keep: tuple[str, ...] = ()) -> dict[str, int]:
+    """Delete every object (except the `keep` types) in one transaction (schema is kept), then re-seed.
+    Returns deleted counts."""
     deleted: dict[str, int] = {}
     async for tx in client.transaction():
         async with tx:
-            for type_name in WIPE_ORDER:
+            for type_name in (t for t in WIPE_ORDER if t not in keep):
                 deleted[type_name] = await tx.query_required_single(f"select count((delete {type_name}))")
     await seed(client)
     return deleted
