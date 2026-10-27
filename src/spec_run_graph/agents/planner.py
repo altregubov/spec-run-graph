@@ -24,7 +24,8 @@ You are a senior API test designer. Design test cases for ONE module in the YAML
 format below. Return only new cases (never repeat the "already covered" ones).
 
 Test case fields: title, type (positive|negative|boundary|security|rbac), priority (P0|P1|P2), tags,
-actor (one of the module actors), coverage.requirement_refs (requirement ids), preconditions (text),
+actor (one of the module actors), coverage.requirement_refs (requirement ids), coverage.criteria (ids of the
+acceptance criteria the case checks, e.g. "REQ-ORD-03#2", as listed with the requirements), preconditions (text),
 variables, parameters, steps, expected_results, cleanup. Do NOT set an id - ids are assigned by the system.
 
 Step fields: name, type (http|delay|recipe), actor (only when the step runs as a different module actor than the
@@ -61,6 +62,9 @@ Rules:
   (or on values extracted from the recipe's responses), never on the case's own assumptions. If the scenario
   needs a different value for a fixed field (balance 100, stock 2, a non-empty whitelist), write that setup
   step yourself instead of using the recipe.
+- Recipe outputs hold the value at the moment the recipe captured it (stock_before_order is the stock BEFORE the
+  recipe's own order). A baseline for "unchanged"/"changed by N" checks must be read after the last step that
+  changes it - a recipe output describing the state after its changes, or a GET right before the action under test.
 - Entities created by a test need per-run unique values for unique fields (username, email): define
   variables: {new_username: "qa_{{ $faker.uuid }}"} and use {{ $var.new_username }} - deletes may be soft,
   so a fixed name already exists on the next run.
@@ -99,7 +103,27 @@ Rules:
   Ids and other values created by the system (seed product ids, user ids, order ids) are looked up at run time:
   add an earlier step (e.g. GET /api/.../products) and `extract` the value, then use {{ $extract.x }}.
 - Cover every requirement of the module with positive, negative/boundary, security (missing or invalid
-  token -> 401) and, where several actors exist, rbac cases. Prefer few precise cases over many vague ones.
+  token -> 401) and, where several actors exist, rbac cases. Every acceptance criterion is checked by at least
+  one case: list the criteria a case checks in coverage.criteria.
+- Test-design techniques - apply each one that fits an endpoint of this module. Put the variants of one technique
+  into ONE data-driven case (a parameter row per variant) instead of many similar cases:
+  * every constrained request field (minimum/maximum, length, enum, format): boundary values min-1, min, max,
+    max+1 (invalid ones expect the documented error; the valid ones go into a separate positive case, since one
+    case's assertions run for every row), plus wrong type ("abc" for a number,
+    a number for a string), null, empty string / whitespace-only, a very long or unicode text where the field is
+    free text, and a value outside the enum;
+  * request bodies: an unknown extra field, and a valid body whose values are at the limits (largest accepted
+    amount, smallest positive price);
+  * authentication: missing token (actor "anonymous"), malformed header ("Bearer", "Basic x", "Bearer a.b"),
+    a token that is well-formed but invalid, and the token of a role that must not access the endpoint;
+  * state changes: every documented transition, and every forbidden one from each state (e.g. cancel an order
+    that is already CANCELLED or FAILED), checking that a rejected change leaves the state unchanged;
+  * lists: each filter, sort field and direction, page boundaries (first, last, beyond the last page), the empty
+    result, and filter combinations;
+  * ids in paths: unknown but well-formed id (404) and malformed id (400) where documented;
+  * money and quantities: exact cent arithmetic (0.01 steps, totals of several units) where the specs define it.
+  Expected outcomes still come only from the specs: a variant whose outcome the specs do not define is left out
+  (or tagged "spec-gap" with the set of documented statuses).
 - Creation scenarios: for every endpoint that creates an entity, first decide from the specs what identifies
   that entity in the business domain (a username for an account, an SKU or a manufacturer + model for a product,
   an order number ...) and cover:
@@ -121,6 +145,9 @@ Rules:
   scenarios of a create endpoint, are planned together with that endpoint).
 - Every case tests a distinct behaviour: never return two cases - or a case like an "already covered" one -
   that send the same kind of requests and check the same outcome with only different data or wording.
+- When the specs leave an outcome open (tag "spec-gap"), do not pick one: expect the set of documented statuses that
+  could apply (e.g. "200|401|403" for a soft-deleted user's still-valid token) and assert only what holds for all of
+  them; the run records which one the API chose.
 - Where specifications conflict, follow the OpenAPI contract for expected values, add the tag
   "spec-conflict" and explain the conflict in expected_results.
 - "Observed data" shows real responses of the API (read-only samples taken before planning). Use it to pick
@@ -133,7 +160,8 @@ Rules:
 EXAMPLE = """\
 Example case (data-driven):
 {"title": "Reject order creation with invalid quantities", "type": "boundary", "priority": "P1",
- "tags": ["orders", "bva"], "actor": "customer_standard", "coverage": {"requirement_refs": ["PRD-ORD-43"]},
+ "tags": ["orders", "bva"], "actor": "customer_standard",
+ "coverage": {"requirement_refs": ["PRD-ORD-43"], "criteria": ["PRD-ORD-43#1", "PRD-ORD-43#2"]},
  "parameters": [{"name": "zero-quantity", "qty": 0, "expected_status": 422, "error_code": "MIN_QTY_EXCEEDED"},
                 {"name": "negative-quantity", "qty": -1, "expected_status": 422, "error_code": "NEGATIVE_QTY"}],
  "steps": [{"name": "Attempt order creation with out-of-boundary quantity", "endpoint": "POST /v1/orders",
@@ -213,6 +241,7 @@ def build_prompt(
     recipes: dict[str, RecipeIR] | None = None,
     lessons: list[str] | None = None,
     observed: str = "",
+    coverage_gaps: list[str] | None = None,
 ) -> str:
     own = [endpoints[k] for k in module.endpoints if k in endpoints]
     others = [endpoints[k] for k in sorted(endpoints) if k not in module.endpoints]
@@ -234,7 +263,8 @@ def build_prompt(
         "Endpoints of this module:\n" + "\n".join(endpoint_digest(e) for e in own),
         "Other endpoints usable in setup/lookup steps (full contracts - send every required field):\n"
         + "\n".join(endpoint_digest(e) for e in others),
-        "Requirements:\n" + json.dumps([r.model_dump() for r in reqs]),
+        "Requirements (acceptance criteria keyed by their id for coverage.criteria):\n"
+        + json.dumps([_requirement_view(r) for r in reqs]),
     ]
     if recipes:
         parts.append(
@@ -256,7 +286,19 @@ def build_prompt(
         parts.append("Already covered (do NOT repeat; add only what is missing):\n" + json.dumps(existing))
     else:
         parts.append("No test cases exist yet for this module.")
+    if coverage_gaps:
+        parts.append(
+            "COVERAGE GAPS found after the first planning pass - design new cases that close exactly these gaps "
+            "(several gaps may share one data-driven case; skip a gap only if the listed endpoints cannot test it or "
+            "the specs do not define the expected outcome):\n- " + "\n- ".join(coverage_gaps)
+        )
     return "\n\n".join(parts)
+
+
+def _requirement_view(r: Any) -> dict[str, Any]:
+    data = r.model_dump(exclude={"acceptance_criteria"})
+    data["acceptance_criteria"] = {f"{r.req_id}#{n}": t for n, t in enumerate(r.acceptance_criteria, start=1)}
+    return data
 
 
 async def plan_module(
@@ -270,11 +312,12 @@ async def plan_module(
     lessons: list[str] | None = None,
     observed: str = "",
     rule_hits: dict[str, int] | None = None,
+    coverage_gaps: list[str] | None = None,
 ) -> tuple[list[CaseDraft], list[tuple[str, list[str]]]]:
     deps = PlannerDeps(ctx=ctx, recipes=recipes or {}, rule_hits=rule_hits if rule_hits is not None else {})
     result = await run_structured(
         build_agent,
-        build_prompt(analysis, module, endpoints, existing, recipes, lessons, observed),
+        build_prompt(analysis, module, endpoints, existing, recipes, lessons, observed, coverage_gaps),
         PlannedCases,
         deps=deps,
         model=model or build_model(),

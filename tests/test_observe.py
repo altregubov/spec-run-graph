@@ -140,3 +140,21 @@ def test_step_falling_back_to_the_case_token_beside_explicit_tokens_is_rejected(
     assert len(errors) == 1 and errors[0].startswith("step 3 (catalog)")
     customer = case.model_copy(update={"actor": "user_a"})  # a customer reading its own catalog is fine
     assert _inherited_token_errors(customer, {"admin": "/api/admin", "user_a": "/api/user"}) == []
+
+
+def test_customer_case_calling_admin_endpoints_without_the_admin_actor_is_rejected():
+    from spec_run_graph.domain.ir import CaseDraft, StepIR, _inherited_token_errors
+
+    case = CaseDraft(
+        title="t",
+        type="positive",
+        actor="user_a",
+        steps=[
+            StepIR(name="create", endpoint="POST /api/admin/products", actor="admin", expected_status=201),
+            StepIR(name="catalog", endpoint="GET /api/user/products", expected_status=200),
+            StepIR(name="stock", endpoint="PATCH /api/admin/products/1/stock", expected_status=200),
+        ],
+        cleanup=[StepIR(name="restore", endpoint="PATCH /api/admin/products/1/stock", expected_status=200)],
+    )
+    errors = _inherited_token_errors(case, {"admin": "/api/admin", "user_a": "/api/user"})
+    assert [e.split(" ", 2)[1] for e in errors] == ["3", "4"] and "actor admin" in errors[0]

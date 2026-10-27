@@ -244,6 +244,30 @@ async def test_plan_survives_a_failing_chunk(deps):
     assert [(code, chunk) for code, chunk, _ in summary.failed_chunks] == [("PROD", ["GET /v1/products"])]
 
 
+async def test_gap_fill_pass_sends_the_measured_gaps(deps):
+    """After the first pass the planner is called again with the coverage gaps of what it stored."""
+    from pydantic_ai.messages import ModelResponse, ToolCallPart
+    from pydantic_ai.models.function import FunctionModel
+
+    specs = orders_specs()
+    report = orders_report(specs)
+    ref = [c.model_dump(exclude={"id", "status"}) for c in reference_module().test_cases]
+    ref[1]["steps"][0]["expected_error"].pop("field")
+    prompts: list[str] = []
+
+    def fn(messages, info):
+        prompts.append(str(messages[0].parts[-1].content))
+        return ModelResponse(parts=[ToolCallPart(info.output_tools[0].name, {"cases": ref})])
+
+    deps.model = FunctionModel(fn)
+    deps.settings.srg_plan_chunk_size = 10
+    deps.settings.srg_plan_gap_fill = True
+    summary = await stages.plan_stage(deps, specs, report)
+    gap_prompts = [p for p in prompts if "COVERAGE GAPS" in p]
+    assert gap_prompts and "never expected" in gap_prompts[0]
+    assert summary.gap_fill["ORD"][0] > 0 and "ORD" in summary.open_gaps
+
+
 async def test_test_then_diagnose(deps):
     """Seeded defect (qty > 100 -> 500) is executed, then triaged: one LLM investigation, note stored in Gel."""
     from pydantic_ai.messages import ModelResponse, ToolCallPart

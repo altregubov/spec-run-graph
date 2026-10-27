@@ -24,6 +24,7 @@ class Settings(BaseSettings):
     srg_plan_chunk_size: int = 3  # max endpoints per planner call (keeps LLM answers small)
     srg_recipes: bool = True  # design + verify setup recipes before planning (SRG_RECIPES=false skips it)
     srg_observe: bool = True  # read-only GET samples of the SUT as planner context (SRG_OBSERVE=false skips it)
+    srg_plan_gap_fill: bool = True  # second planner pass for measured coverage gaps (SRG_PLAN_GAP_FILL=false skips)
     # auto: reasoning on for analyze/plan, off for the Bruno synthesizer (mechanical, many calls)
     srg_thinking: Literal["auto", "on", "off"] = "auto"
     srg_max_tokens: int | None = None  # output token limit per call (None = provider default)

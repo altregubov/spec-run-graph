@@ -30,6 +30,7 @@ ANY_TEMPLATE_RE = re.compile(r"\{\{(.*?)\}\}")
 SLUG_RE = re.compile(r"^[a-z0-9]+(-[a-z0-9]+)*$")
 IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 FILTER_IN_PATH = re.compile(r"\[[A-Za-z_][A-Za-z0-9_]*=")
+FILTER_VALUE = re.compile(r"\[[A-Za-z_][A-Za-z0-9_]*=([^\]]*)\]")
 PARAM_TEMPLATE_RE = re.compile(r"^\{\{\s*\$param\.([A-Za-z0-9_]+)\s*\}\}$")
 ANONYMOUS = "anonymous"  # reserved actor: the request carries no credentials (missing-token tests)
 STATUS_SET_RE = re.compile(r"^\d{3}(\s*\|\s*\d{3})+$")
@@ -100,6 +101,7 @@ class StepIR(BaseModel):
 class CoverageIR(BaseModel):
     endpoints: list[str] = Field(default_factory=list)
     requirement_refs: list[str] = Field(default_factory=list)
+    criteria: list[str] = Field(default_factory=list, description='acceptance criteria checked, e.g. "REQ-ORD-03#2"')
 
     @model_validator(mode="before")
     @classmethod
@@ -183,7 +185,11 @@ class ValidationContext:
     response_schemas: dict[str, dict[str, Any]] | None = None
     request_schemas: dict[str, Any] | None = None  # endpoint key -> request body JSON schema
     page_limits: dict[str, tuple[str, int]] | None = None  # paginated endpoint -> (page-size param, maximum)
-    actor_channels: dict[str, str] = field(default_factory=dict)  # login actor -> path channel of its login endpoint
+    newest_first: dict[str, dict[str, str]] = field(default_factory=dict)  # list endpoint -> newest-first query
+    actor_channels: dict[str, str] = field(default_factory=dict)
+    criteria_ids: set[str] = field(
+        default_factory=set
+    )  # "REQ-X#n" ids of all acceptance criteria  # login actor -> path channel of its login endpoint
 
 
 def missing_required(schema: Any, payload: Any, where: str = "payload") -> list[str]:
@@ -346,6 +352,9 @@ def validate_case(case: CaseDraft, ctx: ValidationContext) -> list[str]:
     for ref in case.coverage.requirement_refs:
         if ctx.requirement_ids and ref not in ctx.requirement_ids:
             errors.append(f"unknown requirement_ref {ref!r}")
+    for ref in case.coverage.criteria:
+        if ctx.criteria_ids and ref not in ctx.criteria_ids:
+            errors.append(f"unknown criteria ref {ref!r}: use the ids shown with the requirements (e.g. REQ-X-01#2)")
 
     def check_refs(where: str, obj: Any, extracted: set[str], allow: set[str] = NAMESPACES) -> None:
         for s in _strings(obj):
@@ -497,8 +506,9 @@ def validate_case(case: CaseDraft, ctx: ValidationContext) -> list[str]:
                 )
         if ctx.response_schemas is not None and key and key in ctx.response_schemas:
             statuses = [str(s) for s in step_statuses(step, case.parameters)]
-            schemas = [(ctx.response_schemas[key].get(s) or {}).get("schema") for s in statuses]
-            schemas = [sc for sc in schemas if sc]
+            by_status = {s: (ctx.response_schemas[key].get(s) or {}).get("schema") for s in statuses}
+            by_status = {s: sc for s, sc in by_status.items() if sc}
+            schemas = list(by_status.values())
             paths = list(step.extract.values())
             for a in step.assertions:
                 with contextlib.suppress(CheckSyntaxError):  # syntax errors are reported above
@@ -509,16 +519,38 @@ def validate_case(case: CaseDraft, ctx: ValidationContext) -> list[str]:
                 problems = [body_path_problem(sc, path) for sc in schemas]
                 if schemas and all(problems):
                     errors.append(f"{where}: {problems[0]}; assert only documented fields")
+                elif any(problems):  # one assertion runs for every allowed status / parameter row
+                    failing = [s for s, sc in by_status.items() if body_path_problem(sc, path)]
+                    errors.append(
+                        f"{where}: {path} is not in the documented response for status {', '.join(failing)}, which this "
+                        "step also accepts; assert only what every expected status returns (e.g. response.body.success "
+                        "exists), or split rows/statuses that need different checks into separate cases"
+                    )
         if ctx.page_limits and key in ctx.page_limits and creates_or_cleanup(step, is_cleanup, case.parameters):
             size_param, maximum = ctx.page_limits[key]
             checks = [*step.extract.values(), *(a.check for a in step.assertions)]
             filtered = [c for c in checks if FILTER_IN_PATH.search(c)]
-            if filtered and str(step.request.query.get(size_param, "")) != str(maximum):
+            # a filter on a per-run value ({{ $var.x }}, {{ $extract.x }}) narrows the list to items this case made
+            narrowed = any(
+                ns in ("var", "extract") for v in step.request.query.values() for ns, _ in REF_RE.findall(str(v))
+            )
+            # items this case created (filter value is a template) are the newest; seeded ones (literals) the oldest
+            finds_own = any(
+                any("{{" in v for v in FILTER_VALUE.findall(c)) and not c.endswith("not exists") for c in filtered
+            )
+            sort = ctx.newest_first.get(key, {}) if finds_own and not narrowed else {}
+            wanted = {size_param: str(maximum), **sort}
+            if filtered and any(str(step.request.query.get(k, "")) != v for k, v in wanted.items()):
+                hint = (
+                    f" and {', '.join(f'{k}={v}' for k, v in sort.items())} (the list only grows: items this case "
+                    "created are the newest)"
+                    if sort
+                    else ""
+                )
                 errors.append(
                     f"{where}: {filtered[0].split()[0]} searches one page of a paginated list - other tests add items, "
-                    f"so the wanted item can be on a later page. Send query {size_param}={maximum} and, where the "
-                    "endpoint supports it, sort newest first (e.g. sort_by=created_at, order=desc), or read the "
-                    "entity directly by id"
+                    f"so the wanted item can be on a later page. Send query {size_param}={maximum}{hint}, filter on a "
+                    "value unique to this case (e.g. a {{ $var.x }} manufacturer), or read the entity directly by id"
                 )
         path_part = step.endpoint.split(None, 1)[1] if " " in step.endpoint else ""
         path_vars = {n for ns, n in REF_RE.findall(path_part) if ns == "extract"}
@@ -552,6 +584,11 @@ def _channel(endpoint: str) -> str:
     return "/" + "/".join([s for s in path.split("/") if s and "{" not in s][:2])
 
 
+def criterion_ids(requirements: Any) -> dict[str, str]:
+    """'REQ-ORD-03#2' -> criterion text, for every acceptance criterion (1-based within its requirement)."""
+    return {f"{r.req_id}#{n}": text for r in requirements for n, text in enumerate(r.acceptance_criteria, start=1)}
+
+
 def actor_channels(actors: Any) -> dict[str, str]:
     """Login actors -> channel of their login endpoint ('/api/admin'). Accepts ActorDefs or {name: auth dict}."""
     pairs = actors.items() if isinstance(actors, dict) else ((a.name, a.auth.model_dump()) for a in actors)
@@ -563,31 +600,34 @@ def actor_channels(actors: Any) -> dict[str, str]:
 
 
 def _inherited_token_errors(case: CaseDraft, channels: dict[str, str]) -> list[str]:
-    """A success step that sends the case actor's token to another channel than the one the actor logs in to
-    (admin -> /api/user/...), while other success steps of the case on that channel authenticate with an explicit
-    token: a forgotten header (e.g. an admin case checking the customer catalog -> 403)."""
+    """A success step (cleanup included) that sends the case actor's token to another channel than the one the actor
+    logs in to (user_a -> /api/admin/...), while other success steps of the case on that channel authenticate as
+    someone else (a step actor or an explicit Authorization header): a forgotten identity -> 403."""
     home = channels.get(case.actor or "")
     if not home:
         return []
-    explicit: dict[str, set[str]] = {}
+    identities: dict[str, set[str]] = {}  # channel -> how other steps authenticate there
     inherit: list[tuple[int, StepIR]] = []
-    for i, (step, is_cleanup) in enumerate(http_steps(case), start=1):
-        if is_cleanup or step.type != "http" or not step.endpoint or "login" in step.endpoint.lower():
+    for i, (step, _) in enumerate(http_steps(case), start=1):
+        if step.type != "http" or not step.endpoint or "login" in step.endpoint.lower():
             continue
         if not any(200 <= s < 300 for s in step_statuses(step, case.parameters)):
             continue
+        channel = _channel(step.endpoint)
         auth = next((v for h, v in step.request.headers.items() if h.lower() == "authorization"), None)
         if auth:
-            explicit.setdefault(_channel(step.endpoint), set()).add(str(auth))
-        elif not step.actor and _channel(step.endpoint) != home:
+            identities.setdefault(channel, set()).add(f"header Authorization: {auth}")
+        elif step.actor and step.actor not in (case.actor, ANONYMOUS):
+            identities.setdefault(channel, set()).add(f"actor {step.actor}")
+        elif not step.actor and channel != home:
             inherit.append((i, step))
     return [
-        f"step {i} ({step.name}): sends the token of the case actor {case.actor!r} (who logs in via {home}) to "
-        f"{step.endpoint.split('?')[0]}, while the other {_channel(step.endpoint)} steps of this case authenticate "
-        f"with {' / '.join(sorted(explicit[_channel(step.endpoint)]))}; send that Authorization header (or set the "
-        "step actor)"
+        f"step {i} ({step.name}): has no actor, so it sends the token of the case actor {case.actor!r} (who logs in "
+        f"via {home}) to {step.endpoint.split('?')[0]}, while the other {_channel(step.endpoint)} steps of this case "
+        f"authenticate with {' / '.join(sorted(identities[_channel(step.endpoint)]))}; give this step the same "
+        "identity (set the step actor or the Authorization header)"
         for i, step in inherit
-        if _channel(step.endpoint) in explicit
+        if _channel(step.endpoint) in identities
     ]
 
 
@@ -674,6 +714,10 @@ def normalize(case: CaseDraft) -> CaseDraft:
     """Fold expected_error sugar into assertions; fill computed coverage; number steps; make missing-token steps
     anonymous (a step expecting only 401 without its own Authorization header cannot mean "send my valid token")."""
     data = case.model_copy(deep=True)
+    for ref in data.coverage.criteria:  # a criterion implies its requirement
+        req = ref.rsplit("#", 1)[0]
+        if req not in data.coverage.requirement_refs:
+            data.coverage.requirement_refs.append(req)
     for i, (step, _) in enumerate(http_steps(data), start=1):
         step.step = i
         inherits = (step.actor or data.actor) not in (None, ANONYMOUS)

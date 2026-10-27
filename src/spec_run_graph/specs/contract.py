@@ -77,3 +77,24 @@ def page_limits(endpoints: dict[str, Any]) -> dict[str, tuple[str, int]]:
             if p.get("in") == "query" and p.get("name") in PAGE_SIZE_PARAMS and isinstance(schema.get("maximum"), int):
                 out[key] = (p["name"], schema["maximum"])
     return out
+
+
+def newest_first(endpoints: dict[str, Any]) -> dict[str, dict[str, str]]:
+    """List endpoints that can sort newest first: key -> query ({"sort_by": "created_at", "order": "desc"}), taken
+    from enum parameters offering a creation-time field and a descending direction."""
+    out: dict[str, dict[str, str]] = {}
+    for key, e in endpoints.items():
+        field_param, direction = None, None
+        for p in getattr(e, "parameters", None) or []:
+            values = (p.get("schema") or {}).get("enum") or []
+            if p.get("in") != "query":
+                continue
+            created = next((v for v in values if isinstance(v, str) and "created" in v.lower()), None)
+            if created:
+                field_param = (p["name"], created)
+            desc = next((v for v in values if isinstance(v, str) and v.lower() == "desc"), None)
+            if desc:
+                direction = (p["name"], desc)
+        if field_param and direction:
+            out[key] = dict([field_param, direction])
+    return out

@@ -9,6 +9,7 @@ import os  # noqa: E402
 os.environ["SRG_OUTPUT_MODE"] = "tool"
 os.environ["SRG_RECIPES"] = "false"  # recipe design would consume the scripted test-model answers
 os.environ["SRG_OBSERVE"] = "false"  # no live GET samples in tests (the prompt stays deterministic)
+os.environ["SRG_PLAN_GAP_FILL"] = "false"  # one planner pass per chunk (fake models answer every call the same)
 
 import pytest  # noqa: E402
 

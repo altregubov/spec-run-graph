@@ -380,7 +380,7 @@ async def existing_cases(client: Client, code: str) -> list[dict[str, Any]]:
     rows = await client.query(
         """
         select TestCase { test_id, title, case_type, fingerprint, design_status,
-                          endpoints: { key }, requirements: { req_id } }
+                          endpoints: { key }, requirements: { req_id }, criteria }
         filter .test_module.code = <str>$code and .design_status != DesignStatus.DEPRECATED
         order by .test_id
         """,
@@ -393,6 +393,7 @@ async def existing_cases(client: Client, code: str) -> list[dict[str, Any]]:
             "type": str(r.case_type).lower(),
             "endpoints": sorted(e.key for e in r.endpoints),
             "requirements": sorted(q.req_id for q in r.requirements),
+            "criteria": list(r.criteria or []),
             "fingerprint": r.fingerprint,
         }
         for r in rows
@@ -479,6 +480,7 @@ async def insert_cases(
                         fingerprint := <str>$fp, tags := <array<str>>$tags,
                         actor := (select Actor filter .test_module = mod and .name = <optional str>$actor),
                         requirements := (select Requirement filter .id in array_unpack(<array<uuid>>$reqs)),
+                        criteria := <array<str>>$crit,
                         preconditions := <array<str>>$pre, variables := <optional json>$vars,
                         parameters := <optional json>$params, expected_results := <array<str>>$results,
                     }
@@ -492,6 +494,7 @@ async def insert_cases(
                     tags=case.tags,
                     actor=case.actor,
                     reqs=req_ids,
+                    crit=case.coverage.criteria,
                     pre=case.preconditions,
                     vars=to_json(case.variables) if case.variables else None,
                     params=to_json(case.parameters) if case.parameters else None,
@@ -524,7 +527,7 @@ async def _insert_steps(tx: Client, test_id: str, case: CaseDraft, persisted: Pe
 
 CASE_SHAPE = """
     test_id, title, case_type, priority, design_status, gen_status, review_reason, tags,
-    actor: { name }, requirements: { req_id }, endpoints: { key },
+    actor: { name }, requirements: { req_id }, endpoints: { key }, criteria,
     preconditions, variables, parameters, expected_results,
     script_path, script_hash, ir_hash, generation_attempts, gen_model, last_gen_error,
     test_module: { code, folder },
@@ -564,7 +567,9 @@ def row_to_ir(r: Any) -> TestCaseIR:
         tags=list(r.tags or []),
         actor=r.actor.name if r.actor else None,
         coverage=CoverageIR(
-            endpoints=sorted(e.key for e in r.endpoints), requirement_refs=sorted(q.req_id for q in r.requirements)
+            endpoints=sorted(e.key for e in r.endpoints),
+            requirement_refs=sorted(q.req_id for q in r.requirements),
+            criteria=list(r.criteria or []),
         ),
         preconditions=list(r.preconditions or []),
         variables=from_json(r.variables) or {},
@@ -910,6 +915,7 @@ async def replace_case(
                     fingerprint := <str>$fp, tags := <array<str>>$tags,
                     actor := (select Actor filter .test_module = tc.test_module and .name = <optional str>$actor),
                     requirements := (select Requirement filter .id in array_unpack(<array<uuid>>$reqs)),
+                    criteria := <array<str>>$crit,
                     preconditions := <array<str>>$pre, variables := <optional json>$vars,
                     parameters := <optional json>$params, expected_results := <array<str>>$results,
                     design_status := <DesignStatus><str>$status, review_reason := <optional str>$reason,
@@ -924,6 +930,7 @@ async def replace_case(
                 tags=case.tags,
                 actor=case.actor,
                 reqs=req_ids,
+                crit=case.coverage.criteria,
                 pre=case.preconditions,
                 vars=to_json(case.variables) if case.variables else None,
                 params=to_json(case.parameters) if case.parameters else None,

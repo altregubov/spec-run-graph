@@ -121,6 +121,7 @@ module default {
     tags: array<str>;
     actor: Actor;
     multi requirements: Requirement;     # coverage.requirement_refs
+    criteria: array<str>;                # coverage.criteria: acceptance criteria checked ("REQ-ORD-03#2")
     preconditions: array<str>;
     variables: json;                     # {"idempotency_key": "{{ $faker.uuid }}"}
     parameters: json;                    # data-driven rows, each with a "name" slug

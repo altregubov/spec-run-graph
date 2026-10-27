@@ -1,5 +1,37 @@
 # Changelog
 
+## v0.4.0 — 2026-10-27
+
+Coverage and variety of generated cases. Clean run without healing on the warehouse API: 135 cases / 215 runs
+(was 103 / 130), 98% without test defects, 193/201 acceptance criteria covered, 23 data-driven cases with 103 rows.
+The Gel schema gains `TestCase.criteria` (applied by `srg doctor` / `srg reset --schema`).
+
+### Added
+- Acceptance-criterion coverage: cases list the criteria they check (`coverage.criteria`, ids `REQ-X#n`, stored on
+  `TestCase.criteria`; validated, and a criterion implies its requirement).
+- Coverage feedback pass (`SRG_PLAN_GAP_FILL`, default on): after all modules' first pass, `pipeline/coverage.py`
+  measures unchecked requirements and criteria (across the whole suite, each requirement owned by one module),
+  documented error statuses never expected, and constrained request fields no negative step breaks; the planner
+  closes them in a second call per chunk. `srg plan` prints criteria coverage and the open gaps.
+- Planner prompt: test-design technique checklist (boundaries, wrong type, null, empty/long/unicode text, extra
+  fields, auth variants, state-transition matrix, list filters/sort/pages, path ids, cent arithmetic), one
+  data-driven case per technique.
+
+### Fixed
+- Stock checks looked up a product the case had just created on page 1 of an oldest-first, ever-growing catalog
+  (9 defects in the first run with the new checklist). When the contract offers a newest-first sort (an enum with
+  a `created...` field plus `desc`), a lookup of a case-created item must use it, unless a per-run filter value
+  already narrows the list; seeded items and `not exists` checks are exempt.
+- A step accepting several statuses (status set or parameter rows) may only assert body paths documented for every
+  one of them (e.g. no `error` check on a step that also accepts 200); the checklist puts valid boundary values
+  into a separate positive case.
+- The cross-channel token rule missed customer cases that call admin endpoints (stock check, balance read, cleanup
+  restore) without `actor: admin`, because only explicit Authorization headers counted as evidence of another
+  identity. Step actors now count too, cleanup steps are checked, and the message names the identity to use.
+- Cases compared stock against a recipe output captured before the recipe's own order (`stock_before_order`):
+  the recipe designer now also outputs values after its changes, and the planner reads baselines after the last
+  change. Spec-gap cases expect the set of documented statuses that could apply instead of picking one.
+
 ## v0.3.3 — 2026-10-27
 
 Duplicate-creation scenarios and fixes from two clean runs. Clean run without healing on the warehouse API:

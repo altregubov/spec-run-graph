@@ -37,6 +37,7 @@ uv run srg doctor             # checks .env, Gel (applies the schema), MinIO, br
 | `SRG_LLM_RETRIES`, `SRG_MAX_TOKENS` | `3`, provider default | validation retries per call; output token limit |
 | `SRG_RECIPES` | `true` | design and verify setup recipes before planning |
 | `SRG_OBSERVE` | `true` | take read-only GET samples of the SUT before planning (planner context) |
+| `SRG_PLAN_GAP_FILL` | `true` | second planner pass for the coverage gaps measured after the first one |
 | `SUT_BASE_URL`, `SUT_HEALTH_PATH` | `http://localhost:8000`, `/` | the API under test and its pre-flight health check |
 | `GEL_DSN`, `S3_*` | docker compose defaults | Gel and MinIO |
 | any `UPPER_CASE` secret | – | referenced by tests as `{{ $env.NAME }}` (e.g. `ADMIN_TOKEN`), passed to bru as process env, never written to files |
@@ -166,6 +167,12 @@ guessing, so healing stays the exception:
   the first actor of its module (`Observation` in Gel). The samples, trimmed to the fields the contract
   guarantees, show the planner and the recipe designer which values exist and how the API formats them (e.g.
   stored casing). They never decide an expected status; the contract does. `SRG_OBSERVE=false` skips this.
+- **Coverage feedback.** Cases name the acceptance criteria they check (`coverage.criteria`, e.g. `REQ-ORD-03#2`).
+  After the first planning pass `pipeline/coverage.py` measures what no case checks: requirements, acceptance
+  criteria, documented error statuses, and constrained request fields (minimum, enum, format ...) that no negative
+  step sends a breaking value for. The planner gets this list in a second pass; `srg plan` prints the criteria
+  coverage and the gaps left. A test-design checklist in the planner prompt (boundaries, wrong types, null, auth
+  variants, state transitions, list filters) asks for one data-driven case per technique.
 - **Workflow recipes.** The recipe designer reads the requirements and builds composite setups for workflows
   whose entities must fit together (e.g. a product plus a customer allowed to see and afford it), so order and
   stock tests never fall back to shared catalogue items. Modules get the actors their recipes run as (e.g.

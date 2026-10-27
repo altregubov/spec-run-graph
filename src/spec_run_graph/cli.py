@@ -169,6 +169,16 @@ def print_plan(state: PipelineGraphState) -> None:
         console.print("  Re-run the same [bold]srg plan[/] command to fill the missing coverage.")
     if p.deprecated:
         console.print(f"  deprecated {p.deprecated} old cases (--replace)")
+    if p.gap_fill:
+        found, added = sum(g for g, _ in p.gap_fill.values()), sum(a for _, a in p.gap_fill.values())
+        console.print(f"  gap-fill pass: {found} coverage gaps after the first pass -> {added} new cases")
+    if p.criteria:
+        covered, total = sum(c for c, _ in p.criteria.values()), sum(t for _, t in p.criteria.values())
+        open_gaps = sum(len(g) for g in p.open_gaps.values())
+        console.print(f"  acceptance criteria covered: {covered}/{total}; open coverage gaps: {open_gaps}")
+        for code, gaps in sorted(p.open_gaps.items()):
+            for gap in gaps[:5]:
+                console.print(f"  [dim]  {code}: {gap[:150]}[/]")
     if p.rule_hits:
         top = sorted(p.rule_hits.items(), key=lambda kv: -kv[1])[:5]
         console.print(f"  [dim]planner corrections: {sum(p.rule_hits.values())} rule violations; most frequent:[/]")

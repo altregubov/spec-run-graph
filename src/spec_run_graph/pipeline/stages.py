@@ -31,6 +31,7 @@ from spec_run_graph.domain.ir import (
     TestCaseIR,
     ValidationContext,
     actor_channels,
+    criterion_ids,
     declared_env_vars,
     fingerprint,
     http_steps,
@@ -48,8 +49,9 @@ from spec_run_graph.engines.bruno.validate import validate_files
 from spec_run_graph.knowledge import repo
 from spec_run_graph.knowledge.repo import CaseFilter
 from spec_run_graph.llm import model_name
+from spec_run_graph.pipeline.coverage import Coverage, module_coverage, requirement_owners
 from spec_run_graph.pipeline.observe import observation_digest, observe
-from spec_run_graph.specs.contract import page_limits, required_body_fields, response_facts
+from spec_run_graph.specs.contract import newest_first, page_limits, required_body_fields, response_facts
 from spec_run_graph.specs.loader import load_specs
 from spec_run_graph.specs.models import LoadedSpec
 from spec_run_graph.specs.openapi import endpoint_digest
@@ -176,6 +178,9 @@ class PlanSummary:
     recipes: dict[str, str] = field(default_factory=dict)  # recipe name -> status (designed in this run)
     observed: int = 0  # GET samples taken from the SUT before planning
     rule_hits: dict[str, int] = field(default_factory=dict)  # validation rule -> times the planner broke it
+    gap_fill: dict[str, tuple[int, int]] = field(default_factory=dict)  # module -> (gaps found, cases added)
+    criteria: dict[str, tuple[int, int]] = field(default_factory=dict)  # module -> (criteria covered, total)
+    open_gaps: dict[str, list[str]] = field(default_factory=dict)  # module -> gaps left after the gap-fill pass
 
 
 # ---------------------------------------------------------------- setup recipes
@@ -294,6 +299,7 @@ async def recipes_stage(
         response_schemas={k: e.response_schemas for k, e in endpoints.items()},
         request_schemas={k: e.request_schema for k, e in endpoints.items()},
         page_limits=page_limits(endpoints),
+        newest_first=newest_first(endpoints),
         actor_channels=actor_channels(module["actors"]),
     )
     schemas = {k: {"request_schema": e.request_schema, "responses": e.response_schemas} for k, e in endpoints.items()}
@@ -399,9 +405,12 @@ async def plan_stage(
 
     chunk_size = max(1, deps.settings.srg_plan_chunk_size)
 
-    async def plan_chunk(m, chunk: list[str], ctx: ValidationContext, existing: list[dict]) -> list[CaseDraft]:
+    async def plan_chunk(
+        m, chunk: list[str], ctx: ValidationContext, existing: list[dict], gaps: list[str] | None = None
+    ) -> list[CaseDraft]:
         async with sem:
-            deps.console.print(f"  planning [bold]{m.code}[/] {chunk} ({len(existing)} existing cases)...")
+            what = f"{len(gaps)} coverage gaps" if gaps else f"{len(existing)} existing cases"
+            deps.console.print(f"  planning [bold]{m.code}[/] {chunk} ({what})...")
             try:
                 drafts, dropped = await planner.plan_module(
                     report.analysis,
@@ -414,6 +423,7 @@ async def plan_stage(
                     lessons=lessons,
                     observed=observed,
                     rule_hits=summary.rule_hits,
+                    coverage_gaps=gaps,
                 )
             except Exception as exc:  # one bad LLM answer must not lose the other modules
                 summary.failed_chunks.append((m.code, chunk, f"{exc.__class__.__name__}: {str(exc)[:300]}"))
@@ -424,24 +434,12 @@ async def plan_stage(
 
     lessons = [r.text for r in await repo.lessons(client)]
 
-    async def one(m) -> None:
-        if replace:
-            summary.deprecated += await repo.deprecate_cases(client, m.code)
+    criteria = set(criterion_ids(report.analysis.requirements))
+
+    async def plan_and_store(m, ctx: ValidationContext, jobs: list[tuple[list[str], list[str] | None]]) -> None:
         existing = await repo.existing_cases(client, m.code)
-        ctx = ValidationContext(
-            endpoint_paths=persisted.endpoint_paths,
-            requirement_ids=set(persisted.requirement_ids),
-            actors={a.name for a in m.actors},
-            fixtures={f.name for f in m.fixtures},
-            env_vars=declared_env_vars(*[a for a in m.actors if a.auth.type != "login"], *m.fixtures),
-            response_schemas={k: e.response_schemas for k, e in endpoints.items()},
-            request_schemas={k: e.request_schema for k, e in endpoints.items()},
-            page_limits=page_limits(endpoints),
-            actor_channels=actor_channels(m.actors),
-        )
         shown = [{k: v for k, v in e.items() if k != "fingerprint"} for e in existing]
-        chunks = [m.endpoints[i : i + chunk_size] for i in range(0, len(m.endpoints), chunk_size)] or [[]]
-        results = await asyncio.gather(*(plan_chunk(m, c, ctx, shown) for c in chunks))
+        results = await asyncio.gather(*(plan_chunk(m, chunk, ctx, shown, gaps) for chunk, gaps in jobs))
         seen = {e["fingerprint"] for e in existing}
         fresh: list[CaseDraft] = []
         for d in (d for drafts in results for d in drafts):
@@ -451,9 +449,60 @@ async def plan_stage(
                 continue
             seen.add(fp)
             fresh.append(d)
-        summary.created[m.code] = await repo.insert_cases(client, m.code, fresh, persisted)
+        summary.created.setdefault(m.code, []).extend(await repo.insert_cases(client, m.code, fresh, persisted))
 
-    await asyncio.gather(*(one(m) for m in report.analysis.modules))
+    owners = requirement_owners(report.analysis.modules, report.analysis.requirements)
+
+    async def coverage_of(m) -> Coverage:
+        rows = await repo.load_cases(client, repo.CaseFilter(statuses=["DRAFT", "READY"]))
+        suite = [repo.row_to_ir(r) for r in rows]
+        cases = [c for c, r in zip(suite, rows, strict=True) if r.test_module.code == m.code]
+        reqs = report.analysis.requirements
+        return module_coverage(m, reqs, cases, endpoints, persisted.endpoint_paths, all_cases=suite, owners=owners)
+
+    def module_ctx(m) -> ValidationContext:
+        return ValidationContext(
+            endpoint_paths=persisted.endpoint_paths,
+            requirement_ids=set(persisted.requirement_ids),
+            actors={a.name for a in m.actors},
+            fixtures={f.name for f in m.fixtures},
+            env_vars=declared_env_vars(*[a for a in m.actors if a.auth.type != "login"], *m.fixtures),
+            response_schemas={k: e.response_schemas for k, e in endpoints.items()},
+            request_schemas={k: e.request_schema for k, e in endpoints.items()},
+            page_limits=page_limits(endpoints),
+            newest_first=newest_first(endpoints),
+            actor_channels=actor_channels(m.actors),
+            criteria_ids=criteria,
+        )
+
+    def chunks_of(m) -> list[list[str]]:
+        return [m.endpoints[i : i + chunk_size] for i in range(0, len(m.endpoints), chunk_size)] or [[]]
+
+    async def first_pass(m) -> None:
+        if replace:
+            summary.deprecated += await repo.deprecate_cases(client, m.code)
+        await plan_and_store(m, module_ctx(m), [(c, None) for c in chunks_of(m)])
+
+    async def gap_fill(m) -> None:
+        """Runs after every module's first pass, so requirements covered by another module are not re-planned."""
+        cov = await coverage_of(m)
+        if deps.settings.srg_plan_gap_fill and cov.gaps:
+            chunks = chunks_of(m)
+            # each gap goes to the chunk that owns its first endpoint; module-wide gaps to the first chunk
+            per_chunk: list[list[str]] = [[] for _ in chunks]
+            for gap in cov.gaps:
+                idx = next((i for i, c in enumerate(chunks) if set(gap.endpoints) & set(c)), 0)
+                per_chunk[idx].append(gap.text)
+            before = len(summary.created.get(m.code, []))
+            await plan_and_store(m, module_ctx(m), [(c, g) for c, g in zip(chunks, per_chunk, strict=True) if g])
+            summary.gap_fill[m.code] = (len(cov.gaps), len(summary.created.get(m.code, [])) - before)
+
+    await asyncio.gather(*(first_pass(m) for m in report.analysis.modules))
+    await asyncio.gather(*(gap_fill(m) for m in report.analysis.modules))
+    for m in report.analysis.modules:
+        cov = await coverage_of(m)
+        summary.criteria[m.code] = (cov.criteria_covered, cov.criteria_total)
+        summary.open_gaps[m.code] = [g.text for g in cov.gaps]
     return summary
 
 
@@ -1148,6 +1197,7 @@ async def lint_findings(deps: GraphDependencies, flt: CaseFilter) -> dict[str, A
             response_schemas={k: e.response_schemas for k, e in drafts.items()},
             request_schemas={k: e.request_schema for k, e in drafts.items()},
             page_limits=page_limits(drafts),
+            newest_first=newest_first(drafts),
             actor_channels=actor_channels(m["actors"]),
         )
         errors = validate_case(repo.row_to_ir(row), ctx)

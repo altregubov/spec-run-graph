@@ -37,6 +37,9 @@ Every business value a test may depend on - amounts, balances, prices, quantitie
 allowed categories/manufacturers, statuses - must be an input with a default, never a literal in the payload: a
 test that needs balance 100 or stock 2 can only pass it through an input. Literals are only for constant
 technical values (role, flags that every caller needs the same).
+When a recipe changes a value it already captured (an order decrements stock and debits the balance), also output
+the value after the change (stock_after_order, remaining_balance) and say in each output description which moment
+it reflects.
 Use the observed data to pick values that exist in this API (category/manufacturer names and their casing).
 
 Recipe fields: name (snake_case), description (what it sets up, what each output holds),
