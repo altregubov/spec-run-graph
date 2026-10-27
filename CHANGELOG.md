@@ -20,6 +20,10 @@ Aim: generate working test cases up front, so healing is rarely needed.
 - Recipes were unusable in modules without the actor their steps run as (e.g. `admin` creating a customer for a
   customer-only module): such cases failed validation and the planner fell back to shared catalogue data. Modules now
   get the actors their recipes need.
+- Fixtures backed by an environment variable that is not set are no longer offered to the planner (they sent empty
+  ids: `ENV_FAILURE`); the analyzer uses env fixtures only for secrets. Re-analysis removes stale fixtures from Gel.
+- The lesson extractor states the scope its evidence shows and prefers tolerant instructions over claims about the
+  API (a single heal had produced "manufacturers are always lowercase").
 - Observed samples are trimmed to contract-guaranteed fields, so optional ones (`requestId`, `pagination`) do not
   invite assertions.
 

@@ -33,7 +33,9 @@ Produce:
        (e.g. admin, user_a, user_b). The test collection logs in at run time; never invent credentials.
      * Otherwise secrets are env references, e.g. {type: "bearer", token: "{{ $env.CUSTOMER_TOKEN }}"}.
      * If "Existing actors" are listed below, reuse those actor names for the same accounts.
-   - fixtures: reusable test data mentioned in the documents (e.g. active_sku: "SKU-ACTIVE-1").
+   - fixtures: reusable test data mentioned in the documents (e.g. active_sku: "SKU-ACTIVE-1"), as literal
+     values. Use {"env": "VAR"} only for secrets the user must provide; never for ids or other values the
+     system generates (tests look those up at run time).
    - default_headers: e.g. {"Accept": "application/json"}.
    - base_path: leave empty unless the server prefix is NOT already part of the OpenAPI paths.
 3. requirements: every verifiable requirement. Reuse ids from the documents (e.g. PRD-ORD-42);

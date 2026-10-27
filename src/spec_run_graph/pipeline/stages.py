@@ -168,6 +168,7 @@ class PlanSummary:
     dropped_invalid: list[tuple[str, str, list[str]]] = field(default_factory=list)
     duplicates: list[tuple[str, str]] = field(default_factory=list)
     flagged_for_review: int = 0
+    unset_fixtures: list[str] = field(default_factory=list)  # "MODULE.fixture (VAR)" dropped: VAR is not set
     deprecated: int = 0
     failed_chunks: list[tuple[str, list[str], str]] = field(default_factory=list)  # (module, endpoints, error)
     refreshed: list[str] = field(default_factory=list)  # modules updated by refresh_only
@@ -373,7 +374,13 @@ async def plan_stage(
             client, m, report.analysis_id, persisted.spec_ids.get(target or ""), persisted.spec_ids.get(prd or "")
         )
 
+    available = {**os.environ, **dotenv_values()}
     for m in report.analysis.modules:
+        # an env-backed fixture whose variable is not set would send an empty value (ENV_FAILURE at run time);
+        # without it the planner looks the value up instead
+        unset = [f for f in m.fixtures if f.env and not available.get(f.env)]
+        summary.unset_fixtures += [f"{m.code}.{f.name} ({f.env})" for f in unset]
+        m.fixtures = [f for f in m.fixtures if f not in unset]
         await store_module(m)
 
     if refresh_only:

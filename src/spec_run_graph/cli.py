@@ -146,6 +146,10 @@ def print_plan(state: PipelineGraphState) -> None:
         return
     if p.observed:
         console.print(f"  observed {p.observed} read-only GET samples of the SUT (planner context)")
+    if p.unset_fixtures:
+        console.print(
+            "  [yellow]fixtures skipped, their environment variable is not set[/]: " + ", ".join(p.unset_fixtures)
+        )
     if p.recipes:
         console.rule("[bold]Setup recipes")
         for name, status in sorted(p.recipes.items()):

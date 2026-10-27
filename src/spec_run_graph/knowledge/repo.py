@@ -336,6 +336,11 @@ async def upsert_module(
             desc=fx.description,
             value=to_json(value),
         )
+    await client.query(  # fixtures the module no longer has (re-analysis, unset env variable)
+        "delete Fixture filter .test_module.code = <str>$code and .name not in array_unpack(<array<str>>$names)",
+        code=m.code,
+        names=[fx.name for fx in m.fixtures],
+    )
 
 
 async def module_context(client: Client, code: str) -> dict[str, Any]:

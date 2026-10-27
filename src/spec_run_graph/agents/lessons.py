@@ -25,7 +25,9 @@ instruction, e.g. "The API returns the request id only in the x-request-id heade
 response.body.requestId." or "POST /api/admin/users needs role and balance; created users start inactive
 until ...". Skip fixes that are specific to one test (typos, a wrong step order). A lesson must never contradict the
 OpenAPI contract: if the API deviates from it (e.g. accepts a request without a required field), that is an
-application bug, not a lesson.
+application bug, not a lesson. State exactly the scope the evidence shows (which endpoint, which kind of
+data): one fix with values set through one endpoint does not prove how ALL data is stored. When unsure, prefer a
+tolerant instruction ("compare case-insensitively") over a claim about the API ("values are lowercase").
 For each lesson give: text (one or two sentences, max 300 characters, no test ids), endpoints (endpoint keys
 it is about; empty when it applies everywhere), fixes (indexes of the fixes that support it), and confirms
 (the exact text of an existing lesson when the fixes only confirm it - then repeat that text)."""
