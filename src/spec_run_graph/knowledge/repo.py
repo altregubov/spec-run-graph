@@ -411,6 +411,16 @@ async def deprecate_cases(client: Client, code: str) -> int:
     )
 
 
+async def deprecate_case(client: Client, test_id: str) -> None:
+    await client.query(
+        """
+        update TestCase filter .test_id = <str>$test_id
+        set { design_status := DesignStatus.DEPRECATED, updated_at := datetime_current() }
+        """,
+        test_id=test_id,
+    )
+
+
 def _step_rows(case: CaseDraft, persisted: PersistedSpecs) -> list[dict[str, Any]]:
     rows = []
     for seq, (s, is_cleanup) in enumerate(http_steps(case), start=1):
@@ -1139,7 +1149,10 @@ async def recipe_rows(client: Client) -> list[Any]:
 
 async def recipes_designed_for(client: Client, analysis_id: str) -> bool:
     return bool(
-        await client.query_single("select exists (select SetupRecipe filter .analysis_id = <str>$a)", a=analysis_id)
+        await client.query_single(
+            "select exists (select SetupRecipe filter .analysis_id = <str>$a and <str>.status != 'UNVERIFIED')",
+            a=analysis_id,
+        )
     )
 
 

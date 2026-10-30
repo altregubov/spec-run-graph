@@ -106,3 +106,64 @@ def test_paginated_lookup_must_sort_newest_first_when_the_contract_allows_it():
     assert not any("paginated" in e for e in validate_case(case.model_copy(update={"steps": [seeded]}), ctx))
     step.request.query.update({"sort_by": "created_at", "order": "desc"})
     assert not any("paginated" in e for e in validate_case(case, ctx))
+
+
+def _module(endpoints, requirement_ids=()):
+    return SimpleNamespace(code="PRD", endpoints=endpoints, requirement_ids=list(requirement_ids))
+
+
+def _create_case(payload, status=201):
+    step = StepIR(name="create", endpoint="POST /api/products", request={"payload": payload}, expected_status=status)
+    return normalize(CaseDraft(title="c", type="positive", steps=[step]))
+
+
+def _technique_gaps(cases):
+    endpoint = SimpleNamespace(response_schemas={}, request_schema=SCHEMA)
+    cov = module_coverage(MODULE, [], cases, {"POST /api/products": endpoint}, PATHS)
+    return [g.text for g in cov.gaps]
+
+
+def test_free_text_and_decimal_fields_need_their_techniques():
+    gaps = _technique_gaps([_create_case({"price": 5, "name": "plain"})])
+    assert any("text name - no successful" in g for g in gaps)
+    assert any("decimal price - no successful" in g for g in gaps)
+    assert any("decimal price - no step sends more digits" in g for g in gaps)
+
+
+def test_techniques_count_as_covered_when_sent():
+    cases = [_create_case({"price": 19.99, "name": "Größe"}), _create_case({"price": 19.999, "name": "x"}, 400)]
+    gaps = _technique_gaps(cases)
+    assert not any("non-ASCII" in g or "cent-precise" in g or "more digits" in g for g in gaps)
+
+
+def test_a_rejected_value_does_not_count_as_stored_text():
+    gaps = _technique_gaps([_create_case({"price": 19.99, "name": "Größe"}, 400)])
+    assert any("non-ASCII" in g for g in gaps) and any("cent-precise" in g for g in gaps)
+
+
+def test_non_ascii_inside_a_variable_counts():
+    step = StepIR(
+        name="c", endpoint="POST /api/products", request={"payload": {"name": "{{ $var.n }}"}}, expected_status=201
+    )
+    case = normalize(CaseDraft(title="c", type="positive", variables={"n": "日本語_{{ $faker.uuid }}"}, steps=[step]))
+    assert not any("non-ASCII" in g for g in _technique_gaps([case]))
+
+
+def test_chunks_answer_only_for_their_own_endpoints():
+    from spec_run_graph.pipeline.coverage import chunk_requirement_ids
+
+    reqs = [
+        SimpleNamespace(req_id="A", endpoints=["GET /a"]),
+        SimpleNamespace(req_id="B", endpoints=["GET /b"]),
+        SimpleNamespace(req_id="X", endpoints=["GET /elsewhere"]),
+    ]
+    module = _module(["GET /a", "GET /b"], ["A", "B", "X"])
+    assert chunk_requirement_ids(module, ["GET /a"], reqs, first=True) == ["A", "X"]
+    assert chunk_requirement_ids(module, ["GET /b"], reqs, first=False) == ["B"]
+
+
+def test_non_ascii_variable_inside_a_list_counts():
+    payload = {"name": ["{{ $var.n }}"]}
+    step = StepIR(name="c", endpoint="POST /api/products", request={"payload": payload}, expected_status=201)
+    case = normalize(CaseDraft(title="c", type="positive", variables={"n": "日本語"}, steps=[step]))
+    assert not any("non-ASCII" in g for g in _technique_gaps([case]))

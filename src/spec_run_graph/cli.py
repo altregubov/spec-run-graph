@@ -169,6 +169,10 @@ def print_plan(state: PipelineGraphState) -> None:
         console.print("  Re-run the same [bold]srg plan[/] command to fill the missing coverage.")
     if p.deprecated:
         console.print(f"  deprecated {p.deprecated} old cases (--replace)")
+    if p.deduped:
+        console.print(f"  duplicate review: removed {len(p.deduped)} cases")
+        for _, drop, keep, reason in p.deduped:
+            console.print(f"    {drop} duplicates {keep}: {reason[:120]}")
     if p.gap_fill:
         found, added = sum(g for g, _ in p.gap_fill.values()), sum(a for _, a in p.gap_fill.values())
         console.print(f"  gap-fill pass: {found} coverage gaps after the first pass -> {added} new cases")

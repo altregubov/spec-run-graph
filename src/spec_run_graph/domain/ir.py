@@ -186,6 +186,7 @@ class ValidationContext:
     request_schemas: dict[str, Any] | None = None  # endpoint key -> request body JSON schema
     page_limits: dict[str, tuple[str, int]] | None = None  # paginated endpoint -> (page-size param, maximum)
     newest_first: dict[str, dict[str, str]] = field(default_factory=dict)  # list endpoint -> newest-first query
+    query_params: dict[str, set[str]] = field(default_factory=dict)  # endpoint key -> documented query parameters
     actor_channels: dict[str, str] = field(default_factory=dict)
     criteria_ids: set[str] = field(
         default_factory=set
@@ -377,7 +378,10 @@ def validate_case(case: CaseDraft, ctx: ValidationContext) -> list[str]:
                         "look the value up in an earlier step (e.g. GET the list, then extract) or use a fixture"
                     )
                 elif ns == "extract" and name not in extracted:
-                    errors.append(f"{where}: $extract.{name} is not extracted by an earlier step")
+                    errors.append(
+                        f"{where}: $extract.{name} is not extracted by an earlier step "
+                        f"(extracted so far: {sorted(extracted) or 'none'})"
+                    )
                 elif ns == "param" and name not in param_keys:
                     errors.append(f"{where}: $param.{name} is missing from some parameter rows")
                 elif ns == "var" and name not in var_names:
@@ -385,6 +389,7 @@ def validate_case(case: CaseDraft, ctx: ValidationContext) -> list[str]:
 
     check_refs("variables", case.variables, set(), {"faker", "fixture", "env"})
 
+    generated_earlier: set[str] = set()  # payload strings with $faker templates sent by earlier steps
     extracted: set[str] = set()
     created: set[str] = set()  # extract vars that hold ids of entities created by this case (non-login POST)
     looked_up: set[str] = set()  # extract vars read from shared lists/entities (GET)
@@ -451,6 +456,18 @@ def validate_case(case: CaseDraft, ctx: ValidationContext) -> list[str]:
                 errors.append(f"{where}: extract name {var!r} must be an identifier")
             if not PATH_RE.match(path):
                 errors.append(f"{where}: extract path {path!r} must be response.body.<path> or response.headers.<h>")
+        for param in _described_but_unsent(step, ctx.query_params.get(key or "", set())):
+            errors.append(
+                f"{where}: the step name says it uses query parameter {param!r} but request.query does not send it - "
+                "the API would apply its default and the assertions would test the wrong thing"
+            )
+        generated = {s for s in _strings(step.request.payload) if "$faker" in s}
+        for value in sorted(generated_earlier & {s for s in _strings(step.request.query) if "$faker" in s}):
+            errors.append(
+                f"{where}: query value {value!r} repeats a $faker template of an earlier step, but every use generates "
+                "a NEW value, so it can never match. Define it once in `variables` and use {{ $var.<name> }} in both"
+            )
+        generated_earlier |= generated
         statuses = step_statuses(step, case.parameters)
         creates = any(200 <= s < 300 for s in statuses)
         body_valid = statuses and not is_cleanup and not any(s in BODY_ERROR_STATUSES for s in statuses)
@@ -629,6 +646,20 @@ def _inherited_token_errors(case: CaseDraft, channels: dict[str, str]) -> list[s
         for i, step in inherit
         if _channel(step.endpoint) in identities
     ]
+
+
+def _described_but_unsent(step: StepIR, documented: set[str]) -> list[str]:
+    """Documented query parameters a step's name announces but its request does not send. A plain word ("page", "order")
+    only counts together with a value ("page 2", "order=asc")."""
+    name = step.name or ""
+    if re.search(r"\b(without|omit\w*|missing|no|default\w*)\b", name, re.I):
+        return []
+    return sorted(
+        p
+        for p in documented
+        if p not in step.request.query
+        and re.search(rf"\b{re.escape(p)}\b{'' if '_' in p else r'(?=\s*=|\s+\d)'}", name)
+    )
 
 
 def creates_or_cleanup(step: StepIR, is_cleanup: bool, parameters: list[dict[str, Any]]) -> bool:

@@ -265,3 +265,122 @@ def test_optional_response_field_rejected():
         ]
     }
     assert "optional" in body_path_problem(merged, "response.body.b")
+
+
+def _described_step(name, query=None):
+    from spec_run_graph.domain.ir import StepIR
+
+    return StepIR(name=name, endpoint="GET /api/items", request={"query": query or {}}, expected_status=200)
+
+
+def test_step_announcing_a_query_parameter_must_send_it():
+    from spec_run_graph.domain.ir import _described_but_unsent
+
+    documented = {"page_size", "page"}
+    assert _described_but_unsent(_described_step("Read a page with page_size 2"), documented) == ["page_size"]
+    assert _described_but_unsent(_described_step("Read a page with page_size 2", {"page_size": 2}), documented) == []
+    assert _described_but_unsent(_described_step("Read without page_size"), documented) == []
+    assert _described_but_unsent(_described_step("Default page_size applies"), documented) == []
+
+
+def _dedup_case(test_id, endpoint="GET /a"):
+    from spec_run_graph.domain.ir import StepIR, TestCaseIR
+
+    step = StepIR(name="s", endpoint=endpoint, expected_status=200)
+    return TestCaseIR(id=test_id, title=test_id, type="positive", steps=[step])
+
+
+def _accepted(found, cases, candidates):
+    from spec_run_graph.agents.dedup import Duplicate, accepted
+
+    paths = {"GET /a": "/a", "GET /b": "/b"}
+    return accepted([Duplicate(drop=d, keep=k, reason="r") for d, k in found], cases, candidates, set(paths), paths)
+
+
+def test_dedup_only_drops_new_cases_for_a_case_on_the_same_endpoint():
+    ids = [f"TC-A-00{i}" for i in range(1, 7)]
+    cases = [_dedup_case(i) for i in ids[:5]] + [_dedup_case(ids[5], "GET /b")]
+    assert [d.drop for d in _accepted([(ids[1], ids[0])], cases, set(ids))] == [ids[1]]
+    assert _accepted([(ids[0], ids[1])], cases, {ids[1]}) == []  # an older case is never dropped
+    assert _accepted([(ids[5], ids[0])], cases, set(ids)) == []  # no shared endpoint
+    assert _accepted([(ids[1], "TC-X-999")], cases, set(ids)) == []  # kept case must exist
+
+
+def test_dedup_is_capped_and_never_drops_the_kept_case():
+    ids = [f"TC-A-00{i}" for i in range(1, 6)]
+    cases = [_dedup_case(i) for i in ids]
+    capped = _accepted([(ids[1], ids[0]), (ids[2], ids[0]), (ids[3], ids[0])], cases, set(ids))
+    assert len(capped) == 2
+    chained = _accepted([(ids[1], ids[2]), (ids[2], ids[0])], cases, set(ids))
+    assert ids[2] not in {d.keep for d in chained}
+
+
+async def test_dedup_review_applies_the_guards_to_the_model_answer():
+    from fake_llm import tool_model
+    from spec_run_graph.agents.dedup import review
+
+    ids = [f"TC-A-00{i}" for i in range(1, 6)]
+    answer = {
+        "duplicates": [
+            {"drop": ids[1], "keep": ids[0], "reason": "same"},
+            {"drop": "TC-X-1", "keep": ids[0], "reason": "x"},
+        ]
+    }
+    found = await review("A", [_dedup_case(i) for i in ids], set(ids), {"GET /a"}, {"GET /a": "/a"}, tool_model(answer))
+    assert [d.drop for d in found] == [ids[1]]
+
+
+def test_a_generated_recipe_input_is_one_value_across_the_recipe():
+    from spec_run_graph.domain.ir import CaseDraft, StepIR
+    from spec_run_graph.domain.recipes import RecipeIR, expand_recipes
+
+    recipe = RecipeIR.model_validate(
+        {
+            "name": "r",
+            "description": "d",
+            "inputs": {"m": {"description": "maker"}},
+            "outputs": {},
+            "steps": [
+                {
+                    "name": "a",
+                    "endpoint": "POST /p",
+                    "request": {"payload": {"m": "{{ $input.m }}"}},
+                    "expected_status": 201,
+                },
+                {
+                    "name": "b",
+                    "endpoint": "GET /p",
+                    "request": {"query": {"m": "{{ $input.m }}"}},
+                    "expected_status": 200,
+                },
+            ],
+        }
+    )
+    use = StepIR(name="u", type="recipe", recipe="r", inputs={"m": "qa-{{ $faker.uuid }}"})
+    case, errors = expand_recipes(CaseDraft(title="c", type="positive", steps=[use]), {"r": recipe})
+    assert not errors
+    assert case.steps[0].request.payload["m"] == case.steps[1].request.query["m"]
+    assert "$var." in case.steps[1].request.query["m"]
+    assert "qa-{{ $faker.uuid }}" in case.variables.values()
+
+
+def test_a_lookup_cannot_repeat_a_faker_template():
+    from spec_run_graph.domain.ir import CaseDraft, StepIR, ValidationContext, validate_case
+
+    steps = [
+        StepIR(name="a", endpoint="POST /p", request={"payload": {"m": "qa-{{ $faker.uuid }}"}}, expected_status=201),
+        StepIR(name="b", endpoint="GET /p", request={"query": {"m": "qa-{{ $faker.uuid }}"}}, expected_status=200),
+    ]
+    errors = validate_case(
+        CaseDraft(title="c", type="positive", steps=steps), ValidationContext({"POST /p": "/p", "GET /p": "/p"})
+    )
+    assert any("generates a NEW value" in e for e in errors)
+
+
+def test_text_fixture_values_become_numbers_in_numeric_fields():
+    from spec_run_graph.engines.bruno.compiler import _as_schema_type
+
+    assert _as_schema_type("500.00", {"type": "number"}) == 500.0
+    assert _as_schema_type("25", {"type": "integer"}) == 25
+    assert _as_schema_type("abc", {"type": "number"}) == "abc"
+    assert _as_schema_type("25", {"type": "string"}) == "25"

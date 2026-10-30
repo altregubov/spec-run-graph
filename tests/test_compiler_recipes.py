@@ -492,3 +492,10 @@ def test_missing_token_steps_become_anonymous_and_compile_without_auth():
     assert "auth" not in docs[planned[0].filename]["http"]  # no credentials
     texts = {p.filename: dump_yaml(docs[p.filename]) for p in planned}
     assert validate_files(tc, MODULE, planned, texts, set())[0] == []
+
+
+def test_header_name_lists_compare_case_insensitively():
+    from spec_run_graph.engines.bruno.compiler import _HEADER_NAME_LIST_RE
+
+    assert _HEADER_NAME_LIST_RE.fullmatch("response.headers.Access-Control-Expose-Headers")
+    assert not _HEADER_NAME_LIST_RE.fullmatch("response.headers.X-Request-ID")

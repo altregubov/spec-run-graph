@@ -123,6 +123,10 @@ def expand_recipes(case: CaseDraft, recipes: dict[str, RecipeIR]) -> tuple[CaseD
             errors.append(f"step {idx} ({step.name}): recipe {r.name} needs inputs {missing}")
             continue
         own = f"{step.alias or r.name}_{idx}_"  # internal names of this use
+        for k, v in inputs.items():  # a generated input must stay one value in all the recipe's steps
+            if isinstance(v, str) and "$faker" in v:
+                variables[own + "in_" + k] = v
+                inputs[k] = "{{ $var." + own + "in_" + k + " }}"
         out_prefix = f"{step.alias}_" if step.alias else ""
         extracts = {v for s in r.steps for v in s.extract}
         rename = {

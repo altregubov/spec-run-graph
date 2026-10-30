@@ -21,6 +21,7 @@ import httpx
 import yaml
 
 from spec_run_graph.agents import analyzer, diagnostics, healer, planner, synthesizer
+from spec_run_graph.agents import dedup as dedup_agent
 from spec_run_graph.config import dotenv_values
 from spec_run_graph.deps import GraphDependencies
 from spec_run_graph.domain.analysis import AnalysisReport, SpecRef
@@ -49,9 +50,9 @@ from spec_run_graph.engines.bruno.validate import validate_files
 from spec_run_graph.knowledge import repo
 from spec_run_graph.knowledge.repo import CaseFilter
 from spec_run_graph.llm import model_name
-from spec_run_graph.pipeline.coverage import Coverage, module_coverage, requirement_owners
+from spec_run_graph.pipeline.coverage import Coverage, chunk_requirement_ids, module_coverage, requirement_owners
 from spec_run_graph.pipeline.observe import observation_digest, observe
-from spec_run_graph.specs.contract import newest_first, page_limits, required_body_fields, response_facts
+from spec_run_graph.specs.contract import newest_first, page_limits, query_params, required_body_fields, response_facts
 from spec_run_graph.specs.loader import load_specs
 from spec_run_graph.specs.models import LoadedSpec
 from spec_run_graph.specs.openapi import endpoint_digest
@@ -181,6 +182,7 @@ class PlanSummary:
     gap_fill: dict[str, tuple[int, int]] = field(default_factory=dict)  # module -> (gaps found, cases added)
     criteria: dict[str, tuple[int, int]] = field(default_factory=dict)  # module -> (criteria covered, total)
     open_gaps: dict[str, list[str]] = field(default_factory=dict)  # module -> gaps left after the gap-fill pass
+    deduped: list[tuple[str, str, str, str]] = field(default_factory=list)  # (module, dropped, kept, reason)
 
 
 # ---------------------------------------------------------------- setup recipes
@@ -300,10 +302,17 @@ async def recipes_stage(
         request_schemas={k: e.request_schema for k, e in endpoints.items()},
         page_limits=page_limits(endpoints),
         newest_first=newest_first(endpoints),
+        query_params=query_params(endpoints),
         actor_channels=actor_channels(module["actors"]),
     )
     schemas = {k: {"request_schema": e.request_schema, "responses": e.response_schemas} for k, e in endpoints.items()}
     reachable = await health_check(deps.settings.sut_base_url) is None
+    skip_reason = "SUT unreachable"
+    if not reachable:
+        deps.console.print(
+            f"  [yellow]{deps.settings.sut_base_url} is unreachable: recipes stay unverified and are not offered to "
+            "the planner[/]"
+        )
     prompt = recipe_agent.build_prompt(
         report.analysis.summary,
         module["actors"],
@@ -325,7 +334,13 @@ async def recipes_stage(
         for r in designed:
             if result.get(r.name) == "VERIFIED":
                 continue
-            ok, detail = (await verify_recipe(deps, r, module, schemas)) if reachable else (False, "SUT unreachable")
+            try:
+                ok, detail = (await verify_recipe(deps, r, module, schemas)) if reachable else (False, skip_reason)
+            except (
+                FileNotFoundError
+            ):  # verification needs the bru CLI; unverified recipes are not offered to the planner
+                reachable, skip_reason = False, f"{deps.settings.bru_bin} not found"
+                ok, detail = False, skip_reason
             status = "VERIFIED" if ok else ("FAILED" if reachable else "UNVERIFIED")
             result[r.name] = status
             await repo.save_recipe(client, r, status, detail, report.analysis_id, model_name())
@@ -412,9 +427,11 @@ async def plan_stage(
             what = f"{len(gaps)} coverage gaps" if gaps else f"{len(existing)} existing cases"
             deps.console.print(f"  planning [bold]{m.code}[/] {chunk} ({what})...")
             try:
+                first = chunk == chunks_of(m)[0]
+                scoped = chunk_requirement_ids(m, chunk, report.analysis.requirements, first)
                 drafts, dropped = await planner.plan_module(
                     report.analysis,
-                    m.model_copy(update={"endpoints": chunk}),
+                    m.model_copy(update={"endpoints": chunk, "requirement_ids": scoped}),
                     endpoints,
                     ctx,
                     existing,
@@ -471,6 +488,7 @@ async def plan_stage(
             request_schemas={k: e.request_schema for k, e in endpoints.items()},
             page_limits=page_limits(endpoints),
             newest_first=newest_first(endpoints),
+            query_params=query_params(endpoints),
             actor_channels=actor_channels(m.actors),
             criteria_ids=criteria,
         )
@@ -480,8 +498,31 @@ async def plan_stage(
 
     async def first_pass(m) -> None:
         if replace:
-            summary.deprecated += await repo.deprecate_cases(client, m.code)
+            deprecated = await repo.deprecate_cases(
+                client, m.code
+            )  # awaited first: modules update the total in parallel
+            summary.deprecated += deprecated
         await plan_and_store(m, module_ctx(m), [(c, None) for c in chunks_of(m)])
+
+    async def dedup_module(m) -> None:
+        """Before gap-fill, so coverage a removed case held is planned again."""
+        created = set(summary.created.get(m.code, []))
+        if not deps.settings.srg_plan_dedup or len(created) < 2:
+            return
+        rows = await repo.load_cases(client, repo.CaseFilter(statuses=["DRAFT", "READY"]))
+        cases = [repo.row_to_ir(r) for r in rows if r.test_module.code == m.code]
+        try:
+            async with sem:
+                found = await dedup_agent.review(
+                    m.code, cases, created, set(m.endpoints), persisted.endpoint_paths, deps.model
+                )
+        except Exception as exc:  # noqa: BLE001 - a review failure only leaves duplicates in, like before
+            deps.console.print(f"  [yellow]duplicate review of {m.code} failed[/]: {exc.__class__.__name__}")
+            return
+        for d in found:
+            await repo.deprecate_case(client, d.drop)
+            summary.created[m.code].remove(d.drop)
+            summary.deduped.append((m.code, d.drop, d.keep, d.reason))
 
     async def gap_fill(m) -> None:
         """Runs after every module's first pass, so requirements covered by another module are not re-planned."""
@@ -498,6 +539,7 @@ async def plan_stage(
             summary.gap_fill[m.code] = (len(cov.gaps), len(summary.created.get(m.code, [])) - before)
 
     await asyncio.gather(*(first_pass(m) for m in report.analysis.modules))
+    await asyncio.gather(*(dedup_module(m) for m in report.analysis.modules))
     await asyncio.gather(*(gap_fill(m) for m in report.analysis.modules))
     for m in report.analysis.modules:
         cov = await coverage_of(m)

@@ -1,5 +1,28 @@
 # Changelog
 
+## v0.4.1 — 2026-10-30
+
+Fewer duplicate cases and more functional depth. Clean run without healing on the warehouse API, same analysis:
+144 cases / 207 runs (was 164 / 246), 98% without test defects (unchanged), the same application bugs found.
+
+### Added
+- Duplicate review (`agents/dedup.py`, `SRG_PLAN_DEDUP`, default on): after the first pass an LLM reviews each module's
+  cases for duplicates. Only cases of this run are removed (DEPRECATED), only for a case sharing an endpoint, at most
+  40% per module; gap-fill then re-plans any coverage a removed case held.
+- Coverage gaps for functional techniques: stored text needs a successful non-ASCII value, decimals a cent-precise
+  value and one with too many digits.
+- IR rules: a step naming a query parameter must send it; a query cannot repeat a `$faker` template of an earlier step.
+
+### Fixed
+- Planner chunks received the whole module's requirements, so parallel chunks planned the same behaviour.
+- A `$faker` recipe input was regenerated in each recipe step; it now keeps one value.
+- Fixture values stored as text were sent as JSON strings in numeric fields.
+- `contains` checks on header-name lists (`Access-Control-*-Headers`, `Vary`) are case-insensitive.
+- Recipes left UNVERIFIED (SUT down, `bru` missing) are redesigned on the next plan of that analysis; a missing `bru`
+  no longer crashes planning, and an unreachable SUT is reported.
+- `--replace` undercounted deprecated cases in its summary.
+- Planner prompt: conditions the specs leave open are not pinned to one status; tags must match what a case does.
+
 ## v0.4.0 — 2026-10-27
 
 Coverage and variety of generated cases. Clean run without healing on the warehouse API: 135 cases / 215 runs

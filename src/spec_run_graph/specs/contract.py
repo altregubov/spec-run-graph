@@ -79,6 +79,14 @@ def page_limits(endpoints: dict[str, Any]) -> dict[str, tuple[str, int]]:
     return out
 
 
+def query_params(endpoints: dict[str, Any]) -> dict[str, set[str]]:
+    """Endpoint key -> its documented query parameters."""
+    return {
+        key: {p["name"] for p in getattr(e, "parameters", None) or [] if p.get("in") == "query" and p.get("name")}
+        for key, e in endpoints.items()
+    }
+
+
 def newest_first(endpoints: dict[str, Any]) -> dict[str, dict[str, str]]:
     """List endpoints that can sort newest first: key -> query ({"sort_by": "created_at", "order": "desc"}), taken
     from enum parameters offering a creation-time field and a descending direction."""

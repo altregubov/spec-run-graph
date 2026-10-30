@@ -68,6 +68,8 @@ Rules:
 - Entities created by a test need per-run unique values for unique fields (username, email): define
   variables: {new_username: "qa_{{ $faker.uuid }}"} and use {{ $var.new_username }} - deletes may be soft,
   so a fixed name already exists on the next run.
+- Every use of a {{ $faker.x }} template generates a NEW value. A generated value used in more than one step (created
+  in one step, filtered or compared in a later one) goes into `variables` once and is referenced as {{ $var.<name> }}.
 - Never assume a pristine database: other tests create, buy and delete data, so balances, stock, counts and
   list order change. Capture a baseline in an earlier step (extract the balance/count) and assert relative to it;
   select list items by attribute with a filter path, e.g. response.body.data[model='Galaxy S24'].id, never by a
@@ -89,7 +91,15 @@ Rules:
   invented fields); for lists use the documented item fields (e.g. data[0].id, not data[0].product_id).
 - Expected statuses: when the requirements or the contract allow several statuses for the same condition
   ("401 or 403", "rejected with 400 or 422"), set expected_status to all of them, e.g. "401|403" (each must be
-  documented for the endpoint). Otherwise use the single documented status.
+  documented for the endpoint). Otherwise use the single documented status. A condition named in "Specification
+  conflicts" or described as open ("pending", "to be resolved", "a 4xx error") is never pinned to one status: use the
+  set of documented candidates, tag the case "spec-conflict", and assert the error code only if every candidate
+  documents it.
+- Tags describe what the case really does: a case whose requests run one after another is not "concurrency" or
+  "parallel", however much it resembles such a scenario.
+- Query parameters named in a step (its name, or the behaviour it checks) go into request.query, e.g. "Read a page
+  with page_size 2" sends query {"page_size": 2}. A CORS check sends an Origin request header. Response header NAMES inside header values are case-insensitive
+  (X-Request-ID = X-Request-Id).
 - Test only behaviour the specifications define. Do not assert undefined details such as case sensitivity of
   enum/sort values, whitespace trimming or the order of ties; leave them out instead of guessing. (Duplicate
   creation is not such a detail - see the creation scenarios below.)
@@ -110,7 +120,7 @@ Rules:
   * every constrained request field (minimum/maximum, length, enum, format): boundary values min-1, min, max,
     max+1 (invalid ones expect the documented error; the valid ones go into a separate positive case, since one
     case's assertions run for every row), plus wrong type ("abc" for a number,
-    a number for a string), null, empty string / whitespace-only, a very long or unicode text where the field is
+    a number for a string), null, empty string / whitespace-only, a very long text where the field is
     free text, and a value outside the enum;
   * request bodies: an unknown extra field, and a valid body whose values are at the limits (largest accepted
     amount, smallest positive price);
@@ -121,7 +131,12 @@ Rules:
   * lists: each filter, sort field and direction, page boundaries (first, last, beyond the last page), the empty
     result, and filter combinations;
   * ids in paths: unknown but well-formed id (404) and malformed id (400) where documented;
-  * money and quantities: exact cent arithmetic (0.01 steps, totals of several units) where the specs define it.
+  * money: positive cases with cent-precise values (0.01, 19.99, not only round amounts) whose stored value is read
+    back and whose totals are computed exactly, e.g. 3 x 0.07 = 0.21 and a balance reduced by exactly that. Also a
+    value with more digits than the documented precision (19.999): its documented error, or if the specs do not say
+    whether it is rejected or rounded, the documented status set with the tag "spec-gap";
+  * free text that the API stores (names, models, categories): a positive case with non-ASCII text (e.g. "Größe-日本語"),
+    read back and compared unchanged, and, where the specs define matching on it, the same value used to match.
   Expected outcomes still come only from the specs: a variant whose outcome the specs do not define is left out
   (or tagged "spec-gap" with the set of documented statuses).
 - Creation scenarios: for every endpoint that creates an entity, first decide from the specs what identifies

@@ -73,6 +73,10 @@ var __srg = {
 };"""
 
 
+# response headers whose value is a list of header names, which HTTP compares case-insensitively
+_HEADER_NAME_LIST_RE = re.compile(r"response\.headers\.(access-control-(allow|expose)-headers|vary)", re.I)
+
+
 class Unsupported(Exception):
     """The case uses a feature the deterministic compiler does not translate."""
 
@@ -174,6 +178,16 @@ class _Ctx:
         return f"__srg.walk(res.getBody(), [{', '.join(segs)}])"
 
 
+def _as_schema_type(value: Any, schema: dict[str, Any]) -> Any:
+    """Fixture values are stored as text; a numeric field must still receive a JSON number."""
+    if isinstance(value, str) and schema.get("type") in ("integer", "number"):
+        try:
+            return int(value) if schema["type"] == "integer" else float(value)
+        except ValueError:
+            return value
+    return value
+
+
 def _json_body(ctx: _Ctx, payload: Any, schema: Any) -> str:
     """Payload -> JSON text with Bruno templates. A value that is exactly one $extract/$var template is
     written unquoted when the request schema says it is a number/boolean (ids captured as numbers)."""
@@ -193,8 +207,12 @@ def _json_body(ctx: _Ctx, payload: Any, schema: Any) -> str:
             if m and m.group(1) == "fixture":
                 fx = ctx.module["fixtures"].get(m.group(2))
                 if not (isinstance(fx, dict) and "env" in fx):
-                    return conv(fx, node)
-            if m and m.group(1) in ("extract", "var") and node_m.get("type") in ("integer", "number", "boolean"):
+                    return conv(_as_schema_type(fx, node_m), node)
+            if (
+                m
+                and m.group(1) in ("extract", "var", "fixture")
+                and node_m.get("type") in ("integer", "number", "boolean")
+            ):
                 marker = f"@@srg_raw_{len(raw)}@@"
                 raw[marker] = ctx.tpl(value.strip())
                 return marker
@@ -282,10 +300,13 @@ def compile_case(
                     flags = re.match(r"^\(\?([a-z]+)\)", chk.value)  # JS has no inline flags like (?i)
                     pattern = chk.value[flags.end() :] if flags else chk.value
                     expected = f"new RegExp({json.dumps(pattern)}, {json.dumps(flags.group(1) if flags else '')})"
+                actual = ctx.path_js(chk.path)
+                if chk.op == "contains" and _HEADER_NAME_LIST_RE.fullmatch(chk.path) and not chk.is_template:
+                    actual, expected = f"String({actual}).toLowerCase()", json.dumps(str(chk.value).lower())
                 label = a.message or a.check
                 tests.append(
                     f"test({json.dumps(ctx.label(label))}, function () {{\n"
-                    f"  __srg.check({ctx.path_js(chk.path)}, {json.dumps(chk.op)}, {expected});\n}});"
+                    f"  __srg.check({actual}, {json.dumps(chk.op)}, {expected});\n}});"
                 )
         scripts = []
         if before:
