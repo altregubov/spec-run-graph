@@ -48,6 +48,8 @@ Each command ends with an LLM usage line (calls, tokens, call time vs wall time)
 
 ## Commands
 
+Commands are shown as `srg <command>`; run them with `uv run srg <command>`, or activate the virtual environment with `source .venv/bin/activate`.
+
 | Command | What it does |
 |---|---|
 | `srg doctor` | checks `.env`, Gel (applies the schema), MinIO, bru and the LLM |

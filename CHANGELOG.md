@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.4.2 — 2026-11-01
+
+Documentation only; no change to the framework's behaviour.
+
+- README: repository banner.
+- README: what each pipeline step reads and writes, and how `srg plan --from` uses the spec files.
+- README: how to run the commands (`uv run srg <command>` or an activated virtual environment).
+
 ## v0.4.1 — 2026-10-30
 
 Fewer duplicate cases and more functional depth. Clean run without healing on the warehouse API, same analysis:
