@@ -63,6 +63,23 @@ Each command ends with an LLM usage line (calls, tokens, call time vs wall time)
 | `srg web` | dashboard + QA chatbot on http://127.0.0.1:8090 |
 | `srg reset` | wipe Gel data and the S3 bucket (lessons are kept; `--knowledge` deletes them) |
 
+## What each step reads and writes
+
+Test cases are generated from the specs once, by `srg plan`, and stored in Gel. Later steps work from Gel, not from the specs. `srg go` runs steps 1-5.
+
+| Step | Reads | Writes to Gel | Writes elsewhere |
+|---|---|---|---|
+| 1. `analyze` (LLM) | spec files; known actors and previous spec versions from Gel | nothing | `reports/analysis/<id>.{json,md}` |
+| 2. `plan` (LLM) | spec files, analysis, `.env`, live API (read-only GETs and recipe checks); lessons, observations, recipes and existing cases from Gel | `FeatureSpec`, `ApiEndpoint`, `Requirement`, `Analysis`, `TestModule`, `Actor`, `Fixture`, `Observation`, `SetupRecipe`, `TestCase`, `TestStep` | `reports/recipes/<name>/`; recipe checks create data on the API |
+| 3. `build` (LLM only as fallback) | `DRAFT`/`READY` cases, modules and endpoint schemas from Gel; existing Bruno files | generation status and hashes on `TestCase` | `test_generated/bruno/`, `test_generated/.srg-bruno-manifest.json`; deletes files of unselected cases |
+| 4. `test` | generated cases from Gel; Bruno files, manifest, `.env` | `TestRun`, `TestExecution` | `reports/runs/<run_id>/`; logs in MinIO |
+| 5. `diagnose` (rules + LLM) | failed executions, cases, requirements, contracts and history from Gel | `DiagnosticNote`; `TEST_DEFECT` cases become `NEEDS_REVIEW` | nothing |
+| 6. `heal` (LLM, not part of `go`) | `TEST_DEFECT` failures, cases, contracts, recipes, lessons from Gel | repaired `TestCase`/`TestStep`, `HealAttempt`, verification `TestRun`, `Lesson` | rebuilt Bruno files |
+
+`srg plan --from <id>.json` skips the analysis but still reads the spec files: requirements and modules come from the report, endpoint contracts from the specs. The specs must stay at the paths saved in the report and be unchanged; otherwise it stops and asks for a new `srg analyze`.
+
+`test_generated/` can be rebuilt with `srg build --force`. Gel holds the cases, lessons and run history: regenerated cases will differ, and the history is not recoverable.
+
 ## Providing specs
 
 Pass spec files or folders; everything given to one command is analysed jointly:
