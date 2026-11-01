@@ -1,5 +1,7 @@
 # SpecRunGraph
 
+![SpecRunGraph: API specifications in, executed tests out](docs/spec-run-graph-banner.jpg)
+
 SpecRunGraph turns API specifications (OpenAPI + Markdown PRDs) into executed API tests:
 
 ```
