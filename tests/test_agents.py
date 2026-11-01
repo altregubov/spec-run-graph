@@ -1,12 +1,16 @@
 """Agents with test models (no network). Production uses the single .env model for all of them."""
 
+import asyncio
+
 import pytest
-from pydantic_ai import ModelRetry
+from pydantic_ai import Agent, ModelRetry
+from pydantic_ai.messages import ToolReturnPart
+from pydantic_ai.models.function import DeltaToolCall, FunctionModel
 
 from fake_llm import synthesizer_model, tool_model
 from helpers import orders_analysis, orders_specs, reference_module
 from spec_run_graph.agents import analyzer, planner, synthesizer
-from spec_run_graph.agents.chatbot import guard_query
+from spec_run_graph.agents.chatbot import guard_query, stream_answer
 from spec_run_graph.domain.ir import ValidationContext
 from spec_run_graph.engines.bruno.naming import plan_files
 
@@ -135,3 +139,29 @@ async def test_run_structured_falls_back_to_prompted_on_broken_tool_json():
     out = await analyzer.analyze(orders_specs(), model=FunctionModel(fn))
     assert [m.code for m in out.modules] == ["PROD", "ORD"]
     assert calls["tool"] >= 2 and calls["prompted"] == 1
+
+
+def test_chat_streams_the_answer_after_a_tool_call():
+    """A preamble before a tool call must not end the stream: the answer comes after the tool result."""
+
+    async def stream(messages, info):
+        if any(isinstance(p, ToolReturnPart) for m in messages for p in m.parts):
+            yield "the "
+            yield "answer"
+        else:
+            yield "Looking it up."
+            yield {0: DeltaToolCall(name="lookup", json_args="{}", tool_call_id="c1")}
+
+    agent = Agent(FunctionModel(stream_function=stream))
+
+    @agent.tool_plain
+    def lookup() -> str:
+        return "data"
+
+    saved = []
+
+    async def collect():
+        return [d async for d in stream_answer(agent, "specs?", saved.extend)]
+
+    assert "".join(asyncio.run(collect())) == "Looking it up.\n\nthe answer"
+    assert any(isinstance(p, ToolReturnPart) for m in saved for p in m.parts)

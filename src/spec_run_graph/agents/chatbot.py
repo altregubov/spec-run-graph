@@ -5,11 +5,13 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass, field
 from typing import Any
 
 import gel
-from pydantic_ai import Agent, ModelRetry, RunContext
+from pydantic_ai import Agent, AgentRunResultEvent, ModelRetry, RunContext
+from pydantic_ai.messages import PartDeltaEvent, PartStartEvent, TextPart, TextPartDelta
 
 from spec_run_graph.config import get_settings
 from spec_run_graph.knowledge import db, stats
@@ -55,6 +57,30 @@ def guard_query(query: str) -> str:
 def _dump(data: Any) -> str:
     text = json.dumps(data, default=str)
     return text if len(text) < 30000 else text[:30000] + " ...(truncated)"
+
+
+async def stream_answer(
+    agent: Agent[ChatDeps, str], message: str, on_done: Callable[[list[Any]], None], **run_kwargs: Any
+) -> AsyncIterator[str]:
+    """Stream the text of every model response. run_stream() would stop at the first text, so a model that says
+    "I'll look it up" before calling a tool would lose its real answer."""
+    seen_text = False
+    async with agent.run_stream_events(message, **run_kwargs) as events:
+        async for event in events:
+            if isinstance(event, PartStartEvent) and isinstance(event.part, TextPart):
+                delta = event.part.content
+                if seen_text:
+                    delta = "\n\n" + delta
+            elif isinstance(event, PartDeltaEvent) and isinstance(event.delta, TextPartDelta):
+                delta = event.delta.content_delta
+            elif isinstance(event, AgentRunResultEvent):
+                on_done(event.result.all_messages())
+                continue
+            else:
+                continue
+            seen_text = True
+            if delta:
+                yield delta
 
 
 def build_agent() -> Agent[ChatDeps, str]:

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
+from pathlib import Path
 from typing import Any, Literal
 
 from pydantic import BaseModel, Field
@@ -63,3 +65,30 @@ class LoadedSpec(BaseModel):
 
     def endpoint_index(self) -> dict[str, EndpointDraft]:
         return {e.key: e for e in self.endpoints}
+
+
+def requirement_specs(citation: str, specs: list[LoadedSpec]) -> list[str]:
+    """Names of the specs a requirement's free-text citation refers to, in citation order. Names and file names
+    count, longest first so a name inside a longer one does not match; without a match, the first requirements doc."""
+
+    def norm(text: str) -> str:
+        return re.sub(r"[\u2010-\u2015]", "-", text).casefold()
+
+    aliases = sorted(
+        {
+            (norm(alias), s.name)
+            for s in specs
+            for alias in (s.name, Path(s.source_path).name, Path(s.source_path).stem)
+        },
+        key=lambda a: -len(a[0]),
+    )
+    text = norm(citation)
+    found: dict[str, int] = {}
+    for alias, name in aliases:
+        for m in re.finditer(rf"(?<![\w-]){re.escape(alias)}(?![\w-])", text):
+            found[name] = min(found.get(name, m.start()), m.start())
+            text = text[: m.start()] + " " * len(alias) + text[m.end() :]
+    if found:
+        return sorted(found, key=lambda n: found[n])
+    fallback = next((s for s in specs if s.spec_type == "REQUIREMENTS_DOC"), specs[0])
+    return [fallback.name]

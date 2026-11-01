@@ -77,7 +77,7 @@ async def requirement_matrix(client: gel.AsyncIOExecutor) -> list[dict[str, Any]
     raw = await client.query_json(
         f"""
         select Requirement {{
-            req_id, description, spec_name := .spec.name,
+            req_id, description, spec_name := .spec.name, source_ref, cited_spec_names := .cited_specs.name,
             endpoints: {{ key }},
             cases := (select .<requirements[is TestCase] filter {ACTIVE}) {{ test_id, case_type, design_status }},
         }}

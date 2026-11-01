@@ -113,6 +113,31 @@ async def _seed_reference_cases(d: GraphDependencies):
     return specs, report, persisted, ids
 
 
+async def test_requirement_links_every_cited_document_and_keeps_case_links(deps):
+    specs = orders_specs()
+    report = orders_report(specs)
+    persisted = await repo.persist_specs(deps.client, specs, report)
+    await repo.insert_analysis(deps.client, report, list(persisted.spec_ids.values()))
+    for m in report.analysis.modules:
+        await repo.upsert_module(deps.client, m, report.analysis_id, persisted.spec_ids["Orders API"], None)
+    await repo.insert_cases(deps.client, "ORD", reference_module().test_cases, persisted)
+
+    req = next(r for r in report.analysis.requirements if r.req_id == "PRD-ORD-42")
+    req.spec = "openapi.yaml §2 / prd.md §4"
+    await repo.persist_specs(deps.client, specs, report)
+
+    rows = await deps.client.query(
+        """select Requirement { spec_name := .spec.name, cited := .cited_specs.name, source_ref,
+             cases := count(.<requirements[is TestCase]) } filter .req_id = 'PRD-ORD-42'"""
+    )
+    prd = next(s.name for s in specs if s.spec_type == "REQUIREMENTS_DOC")
+    assert len(rows) == 1
+    assert rows[0].spec_name == "Orders API"
+    assert set(rows[0].cited) == {"Orders API", prd}
+    assert rows[0].source_ref == "openapi.yaml §2 / prd.md §4"
+    assert rows[0].cases > 0
+
+
 async def test_plan_build_test_end_to_end(deps):
     specs = orders_specs()
     report = orders_report(specs)

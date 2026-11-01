@@ -30,7 +30,7 @@ module default {
     required content_hash: str { constraint exclusive; }   # idempotent re-ingest
     previous: FeatureSpec;                                 # prior version of the same spec name
     multi link endpoints := .<spec[is ApiEndpoint];
-    multi link requirements := .<spec[is Requirement];
+    multi link requirements := .<cited_specs[is Requirement];
     constraint exclusive on ((.name, .version));
   }
 
@@ -54,7 +54,9 @@ module default {
   }
 
   type Requirement extending Timestamped {
-    required spec: FeatureSpec { on target delete delete source; }
+    required spec: FeatureSpec { on target delete delete source; }   # first cited document (use cited_specs to count per document)
+    multi cited_specs: FeatureSpec;      # every document the requirement cites
+    source_ref: str;                     # citation as analysed, e.g. "TECH_SPEC.md §5.2 / swagger.yaml"
     required req_id: str;                # PRD-ORD-42
     required description: str;
     acceptance_criteria: array<str>;

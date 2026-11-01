@@ -1,5 +1,21 @@
 # Changelog
 
+## v0.4.3 — 2026-11-01
+
+Requirements now link to the documents they really cite, and QA chat answers no longer disappear after a tool call.
+
+### Upgrade
+The schema gained two `Requirement` fields. Run `srg doctor` to apply it. Existing requirements get their new links the next time `srg plan` stores the analysis.
+
+### Added
+- `srg plan` prints numbered steps and per-chunk progress, so you can see what is running.
+- `Requirement.cited_specs` links a requirement to every document it cites, and `Requirement.source_ref` keeps the citation text, including section numbers.
+
+### Fixed
+- Requirements with free-text citations were all stored under the first requirements document. They are now matched to documents deterministically, and a requirement whose document changes keeps its test case links.
+- Spec change detection now compares requirements per cited document, and a changed requirement flags every case linked to its id.
+- QA chat lost the real answer when the model wrote text before calling a tool.
+
 ## v0.4.2 — 2026-11-01
 
 Documentation only; no change to the framework's behaviour.

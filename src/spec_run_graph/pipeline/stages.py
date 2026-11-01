@@ -54,7 +54,7 @@ from spec_run_graph.pipeline.coverage import Coverage, chunk_requirement_ids, mo
 from spec_run_graph.pipeline.observe import observation_digest, observe
 from spec_run_graph.specs.contract import newest_first, page_limits, query_params, required_body_fields, response_facts
 from spec_run_graph.specs.loader import load_specs
-from spec_run_graph.specs.models import LoadedSpec
+from spec_run_graph.specs.models import LoadedSpec, requirement_specs
 from spec_run_graph.specs.openapi import endpoint_digest
 from spec_run_graph.telemetry.s3 import case_prefix, run_prefix
 
@@ -77,7 +77,8 @@ async def analyze_stage(deps: GraphDependencies, paths: list[Path]) -> tuple[lis
     analysis = await analyzer.analyze(specs, model=deps.model, existing_actors=known_actors)
     prd_reqs: dict[str, dict[str, str]] = {}
     for r in analysis.requirements:
-        prd_reqs.setdefault(r.spec, {})[r.req_id] = r.description
+        for name in requirement_specs(r.spec, specs):
+            prd_reqs.setdefault(name, {})[r.req_id] = r.description
     try:
         changes = await repo.spec_changes(deps.client, specs, prd_reqs)
     except Exception as exc:  # Gel down -> analysis still useful
@@ -383,6 +384,12 @@ async def plan_stage(
     update actors/fixtures after a re-analysis)."""
     summary = PlanSummary()
     client = deps.client
+    total_steps = 1 if refresh_only else 7
+
+    def step(number: int, text: str) -> None:
+        deps.console.print(f"[bold cyan][{number}/{total_steps}][/] {text}", highlight=False)
+
+    step(1, "storing specs, analysis and modules in Gel")
     persisted = await repo.persist_specs(client, specs, report)
     await repo.insert_analysis(client, report, list(persisted.spec_ids.values()))
     if persisted.new_versions:
@@ -410,10 +417,15 @@ async def plan_stage(
         summary.refreshed = [m.code for m in report.analysis.modules]
         return summary
     endpoints = {e.key: e for s in specs for e in s.endpoints}
+    step(2, f"observing the SUT at {deps.settings.sut_base_url} (read-only GET samples)")
     summary.observed = await observe_stage(deps, report, endpoints)
+    deps.console.print(f"  {summary.observed} samples stored")
     observed = observation_digest(await repo.observations(client))
+    step(3, "preparing setup recipes")
     summary.recipes = await recipes_stage(deps, report, endpoints, persisted.endpoint_paths, observed)
     recipes = await repo.load_recipes(client)
+    if not summary.recipes:
+        deps.console.print(f"  nothing designed in this run; {len(recipes)} stored recipes available")
     for m in add_recipe_actors(report.analysis.modules, recipes):
         await store_module(m)
     sem = asyncio.Semaphore(deps.settings.srg_llm_concurrency)
@@ -447,6 +459,7 @@ async def plan_stage(
                 deps.console.print(f"  [red]planning {m.code} {chunk} failed[/]: {exc.__class__.__name__}")
                 return []
         summary.dropped_invalid += [(m.code, title, errs) for title, errs in dropped]
+        deps.console.print(f"  planned [bold]{m.code}[/] {chunk}: {len(drafts)} drafts, {len(dropped)} invalid")
         return drafts
 
     lessons = [r.text for r in await repo.lessons(client)]
@@ -513,6 +526,7 @@ async def plan_stage(
         cases = [repo.row_to_ir(r) for r in rows if r.test_module.code == m.code]
         try:
             async with sem:
+                deps.console.print(f"  reviewing [bold]{m.code}[/] for duplicates ({len(created)} new cases)...")
                 found = await dedup_agent.review(
                     m.code, cases, created, set(m.endpoints), persisted.endpoint_paths, deps.model
                 )
@@ -535,12 +549,17 @@ async def plan_stage(
                 idx = next((i for i, c in enumerate(chunks) if set(gap.endpoints) & set(c)), 0)
                 per_chunk[idx].append(gap.text)
             before = len(summary.created.get(m.code, []))
+            deps.console.print(f"  [bold]{m.code}[/]: {len(cov.gaps)} coverage gaps to fill")
             await plan_and_store(m, module_ctx(m), [(c, g) for c, g in zip(chunks, per_chunk, strict=True) if g])
             summary.gap_fill[m.code] = (len(cov.gaps), len(summary.created.get(m.code, [])) - before)
 
+    step(4, f"planning test cases for {len(report.analysis.modules)} modules")
     await asyncio.gather(*(first_pass(m) for m in report.analysis.modules))
+    step(5, "reviewing new cases for duplicates")
     await asyncio.gather(*(dedup_module(m) for m in report.analysis.modules))
+    step(6, "checking coverage and filling gaps")
     await asyncio.gather(*(gap_fill(m) for m in report.analysis.modules))
+    step(7, "calculating final coverage")
     for m in report.analysis.modules:
         cov = await coverage_of(m)
         summary.criteria[m.code] = (cov.criteria_covered, cov.criteria_total)

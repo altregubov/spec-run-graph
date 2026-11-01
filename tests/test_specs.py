@@ -1,6 +1,9 @@
+import pytest
+
 from helpers import ROOT, orders_specs
 from spec_run_graph.specs.diff import diff_hashes
 from spec_run_graph.specs.loader import digest, discover
+from spec_run_graph.specs.models import LoadedSpec, requirement_specs
 from spec_run_graph.specs.openapi import schema_brief
 
 
@@ -80,3 +83,32 @@ def test_swagger2_is_discovered_and_parsed(tmp_path):
     assert get.parameters[0]["schema"] == {"type": "string", "format": "uuid"}
     assert get.response_schemas["200"]["schema"]["required"] == ["name"]  # $ref resolved
     assert idx["POST /api/pets"].request_schema["properties"]["age"]["minimum"] == 0
+
+
+def _citation_specs():
+    def spec(name, spec_type, path):
+        return LoadedSpec(name=name, spec_type=spec_type, version="1", source_path=path, raw_content="")
+
+    return [
+        spec("Warehouse - Client Specification", "REQUIREMENTS_DOC", "specs/CLIENT_SPEC.md"),
+        spec("Warehouse Testbench Specification", "REQUIREMENTS_DOC", "specs/TECH_SPEC.md"),
+        spec("Warehouse Testbench", "OPENAPI", "specs/swagger.yaml"),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("citation", "expected"),
+    [
+        ("TECH_SPEC.md §5.2 / swagger.yaml", ["Warehouse Testbench Specification", "Warehouse Testbench"]),
+        (
+            "CLIENT_SPEC.md §2 Journey 2, TECH_SPEC.md §3.2",
+            ["Warehouse - Client Specification", "Warehouse Testbench Specification"],
+        ),
+        ("TECH: Warehouse Testbench Specification", ["Warehouse Testbench Specification"]),
+        ("OpenAPI: Warehouse Testbench v1.2.0", ["Warehouse Testbench"]),
+        ("CLIENT: Warehouse \u2014 Client Specification", ["Warehouse - Client Specification"]),
+        ("the product brief", ["Warehouse - Client Specification"]),
+    ],
+)
+def test_requirement_citation_resolves_to_documents(citation, expected):
+    assert requirement_specs(citation, _citation_specs()) == expected

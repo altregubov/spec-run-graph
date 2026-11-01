@@ -22,7 +22,7 @@ from spec_run_graph.domain.ir import (
 from spec_run_graph.knowledge.db import from_json, to_json
 from spec_run_graph.specs.contract import required_body_fields, response_facts
 from spec_run_graph.specs.diff import SpecChanges, diff_hashes
-from spec_run_graph.specs.models import EndpointDraft, LoadedSpec, sha256
+from spec_run_graph.specs.models import EndpointDraft, LoadedSpec, requirement_specs, sha256
 
 Client = gel.AsyncIOExecutor
 
@@ -150,35 +150,41 @@ async def persist_specs(client: gel.AsyncIOClient, specs: list[LoadedSpec], repo
                     out.endpoint_paths[e.key] = e.path
 
             # requirements (upsert per spec version)
-            spec_by_name = {s.name: s for s in specs}
-            fallback_spec = next((n for n, s in spec_by_name.items() if s.spec_type == "REQUIREMENTS_DOC"), None)
-            fallback_spec = fallback_spec or next(iter(out.spec_ids))
+            known_ids = list(out.spec_ids.values()) + [old for old, _ in out.new_versions.values()]
             for r in report.analysis.requirements:
-                spec_name = r.spec if r.spec in out.spec_ids else fallback_spec
+                cited = [out.spec_ids[n] for n in requirement_specs(r.spec, specs)]
                 ep_ids = [out.endpoint_ids[k] for k in r.endpoints if k in out.endpoint_ids]
-                row = await tx.query_required_single(
-                    """
-                    with spec := (select FeatureSpec filter .id = <uuid>$spec)
-                    select (
-                        insert Requirement {
-                            spec := spec, req_id := <str>$rid, description := <str>$desc,
+                # one row per requirement: a row whose document changed moves, so its test case links stay
+                existing = await tx.query_single(
+                    "select Requirement filter .req_id = <str>$rid and .spec.id in array_unpack(<array<uuid>>$known)"
+                    " limit 1",
+                    rid=r.req_id,
+                    known=known_ids,
+                )
+                fields = """
+                            spec := (select detached FeatureSpec filter .id = <uuid>$spec),
+                            cited_specs := (select detached FeatureSpec filter .id in array_unpack(<array<uuid>>$cited)),
+                            source_ref := <str>$ref, description := <str>$desc,
                             acceptance_criteria := <array<str>>$ac,
                             endpoints := (select ApiEndpoint filter .id in array_unpack(<array<uuid>>$eps)),
-                        } unless conflict on (.spec, .req_id) else (
-                            update Requirement set {
-                                description := <str>$desc, acceptance_criteria := <array<str>>$ac,
-                                endpoints := (select ApiEndpoint filter .id in array_unpack(<array<uuid>>$eps)),
-                                updated_at := datetime_current(),
-                            }
-                        )
-                    ) { id }
-                    """,
-                    spec=out.spec_ids[spec_name],
-                    rid=r.req_id,
-                    desc=r.description,
-                    ac=r.acceptance_criteria,
-                    eps=ep_ids,
-                )
+                """
+                values = {
+                    "spec": cited[0],
+                    "cited": cited,
+                    "ref": r.spec,
+                    "desc": r.description,
+                    "ac": r.acceptance_criteria,
+                    "eps": ep_ids,
+                }
+                if existing is None:
+                    query = f"select (insert Requirement {{ req_id := <str>$rid, {fields} }}) {{ id }}"
+                    row = await tx.query_required_single(query, rid=r.req_id, **values)
+                else:
+                    query = (
+                        "select (update Requirement filter .id = <uuid>$row "
+                        f"set {{ {fields} updated_at := datetime_current() }}) {{ id }}"
+                    )
+                    row = await tx.query_required_single(query, row=existing.id, **values)
                 out.requirement_ids[r.req_id] = str(row.id)
     return out
 
@@ -200,7 +206,7 @@ async def apply_change_impact(client: gel.AsyncIOClient, persisted: PersistedSpe
                         select count((
                             update TestCase
                             filter any(.steps.endpoint.key = <str>$key and .steps.endpoint.spec.id = <uuid>$old)
-                                or any(.requirements.req_id = <str>$key and .requirements.spec.id = <uuid>$old)
+                                or any(.requirements.req_id = <str>$key)
                             set { design_status := DesignStatus.NEEDS_REVIEW, review_reason := <str>$reason,
                                   updated_at := datetime_current() }
                         ))

@@ -17,7 +17,7 @@ from pydantic import BaseModel
 from pydantic_ai.messages import ModelMessage
 from sse_starlette.sse import EventSourceResponse
 
-from spec_run_graph.agents.chatbot import ChatDeps, build_agent
+from spec_run_graph.agents.chatbot import ChatDeps, build_agent, stream_answer
 from spec_run_graph.config import get_settings
 from spec_run_graph.knowledge import db, repo, stats
 from spec_run_graph.llm import LLMNotConfigured, build_model, model_name, request_settings
@@ -143,18 +143,21 @@ async def chat_stream(request: Request, body: ChatIn):
             return
         history = CHAT_HISTORY.get(session, [])
         try:
-            async with request.app.state.chatbot.run_stream(
+            def remember(messages: list[Any]) -> None:
+                if len(CHAT_HISTORY) > MAX_SESSIONS:
+                    CHAT_HISTORY.pop(next(iter(CHAT_HISTORY)))
+                CHAT_HISTORY[session] = messages[-40:]
+
+            async for delta in stream_answer(
+                request.app.state.chatbot,
                 body.message,
+                remember,
                 deps=deps,
                 model=model,
                 message_history=history,
                 model_settings=request_settings(thinking=True, session=session),
-            ) as result:
-                async for delta in result.stream_text(delta=True):
-                    yield {"event": "token", "data": json.dumps(delta)}
-                if len(CHAT_HISTORY) > MAX_SESSIONS:
-                    CHAT_HISTORY.pop(next(iter(CHAT_HISTORY)))
-                CHAT_HISTORY[session] = result.all_messages()[-40:]
+            ):
+                yield {"event": "token", "data": json.dumps(delta)}
         except Exception as exc:  # surface model/tool errors in the chat panel
             yield {"event": "error", "data": f"{exc.__class__.__name__}: {exc}"}
         yield {"event": "trace", "data": json.dumps(deps.trace)}
