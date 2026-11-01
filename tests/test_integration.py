@@ -138,6 +138,18 @@ async def test_requirement_links_every_cited_document_and_keeps_case_links(deps)
     assert rows[0].cases > 0
 
 
+async def test_chat_case_filters_and_modules(deps):
+    await _seed_reference_cases(deps)
+    assert len(await stats.list_cases(deps.client, {"text": "zzz-no-such-title"})) == 0
+    assert len(await stats.list_cases(deps.client, {"path": "zzz-no-such-path"})) == 0
+    assert len(await stats.list_cases(deps.client, {"actor": "zzz-no-such-actor"})) == 0
+    assert await stats.list_cases(deps.client, {"path": "/orders"})
+    assert await stats.list_cases(deps.client, {"actor": "customer_standard"})
+    assert await stats.list_cases(deps.client, {})
+    modules = await stats.list_modules(deps.client)
+    assert modules[0]["code"] == "ORD" and modules[0]["active_cases"] > 0 and modules[0]["actors"]
+
+
 async def test_plan_build_test_end_to_end(deps):
     specs = orders_specs()
     report = orders_report(specs)

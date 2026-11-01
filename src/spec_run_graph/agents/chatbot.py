@@ -17,6 +17,7 @@ from spec_run_graph.config import get_settings
 from spec_run_graph.knowledge import db, stats
 
 MAX_ROWS = 200
+MAX_FAILED_QUERIES = 6
 QUERY_TIMEOUT_S = 10
 FORBIDDEN = re.compile(
     r"\b(insert|update|delete|configure|create|drop|alter|start\s+migration|commit|rollback|reset|"
@@ -27,10 +28,17 @@ FORBIDDEN = re.compile(
 INSTRUCTIONS = """\
 You are the QA assistant of SpecRunGraph. You answer questions about the test knowledge base stored in
 Gel: specifications, API endpoints, requirements, test cases, test runs and executions.
-- Prefer the typed tools (overview, list_test_cases, endpoint_coverage, requirement_coverage, get_case,
-  list_runs, run_results, failing_cases). Use query_gel only when no typed tool fits.
+- Prefer the typed tools (overview, list_modules, list_test_cases, endpoint_coverage, requirement_coverage,
+  get_case, list_runs, run_results, failing_cases). Use query_gel only when no typed tool fits.
 - query_gel accepts ONE read-only EdgeQL `select` (or `with ... select`) statement. The schema is below.
-  Enum values are compared like `.design_status = DesignStatus.READY`; HTTP methods like `HttpMethod.POST`.
+  Enum values are compared like `.design_status = DesignStatus.READY`; HTTP methods like `HttpMethod.POST`;
+  cast an enum before joining text (`<str>.method ++ ' ' ++ .path`).
+  Array properties such as tags: `'admin' in array_unpack(.tags)`. A computed field must not reuse a link's name:
+  `actor_name := .actor.name`, not `actor := .actor.name`.
+- A step can use another actor than its case (TestStep.actor_name). "Admin" tests are not a module here: find
+  them with list_test_cases(actor=...) or list_test_cases(path=...).
+- When query_gel reports an error, change the query or use a typed tool. When it says to stop, answer with what you
+  have and say what you could not determine.
 - Never invent numbers: every figure must come from a tool result. If data is missing, say so.
 - You cannot modify anything; politely refuse requests to change or delete data and point to the CLI
   (`srg plan`, `srg build`, `srg reset`, `srg show <id> --approve`).
@@ -41,6 +49,7 @@ Gel: specifications, API endpoints, requirements, test cases, test runs and exec
 class ChatDeps:
     client: gel.AsyncIOClient
     trace: list[dict[str, Any]] = field(default_factory=list)
+    failed_queries: int = 0
 
 
 def guard_query(query: str) -> str:
@@ -57,6 +66,32 @@ def guard_query(query: str) -> str:
 def _dump(data: Any) -> str:
     text = json.dumps(data, default=str)
     return text if len(text) < 30000 else text[:30000] + " ...(truncated)"
+
+
+def _query_failed(deps: ChatDeps, reason: str) -> str:
+    """Told to the model as a normal result: a retry error would end the whole answer after a few bad queries."""
+    deps.failed_queries += 1
+    if deps.failed_queries >= MAX_FAILED_QUERIES:
+        return f"Query failed: {reason}\nStop querying: answer with what you have and say what you could not determine."
+    return f"Query failed: {reason}"
+
+
+async def run_query(deps: ChatDeps, edgeql: str) -> str:
+    try:
+        q = guard_query(edgeql)
+    except ModelRetry as exc:
+        return _query_failed(deps, exc.message)
+    deps.trace.append({"tool": "query_gel", "args": {}, "edgeql": q})
+    try:
+        raw = await asyncio.wait_for(db.readonly_query(deps.client, q), QUERY_TIMEOUT_S)
+    except gel.errors.EdgeDBError as exc:
+        return _query_failed(deps, str(exc))
+    except TimeoutError:
+        return _query_failed(deps, "timed out; make it more selective.")
+    rows = json.loads(raw)
+    if isinstance(rows, list) and len(rows) > MAX_ROWS:
+        return _dump(rows[:MAX_ROWS]) + f" ...({len(rows) - MAX_ROWS} more rows not shown)"
+    return _dump(rows)
 
 
 async def stream_answer(
@@ -102,6 +137,12 @@ def build_agent() -> Agent[ChatDeps, str]:
         return _dump(await stats.overview(ctx.deps.client))
 
     @agent.tool
+    async def list_modules(ctx: RunContext[ChatDeps]) -> str:
+        """Test modules with their code, folder, domain, base path, actors and number of active test cases."""
+        traced("list_modules", {}, ctx)
+        return _dump(await stats.list_modules(ctx.deps.client))
+
+    @agent.tool
     async def list_test_cases(
         ctx: RunContext[ChatDeps],
         module: str | None = None,
@@ -111,9 +152,13 @@ def build_agent() -> Agent[ChatDeps, str]:
         tag: str | None = None,
         id_glob: str | None = None,
         endpoint: str | None = None,
+        actor: str | None = None,
+        path: str | None = None,
+        text: str | None = None,
     ) -> str:
         """List test cases. status: DRAFT|READY|NEEDS_REVIEW|DEPRECATED; case_type: POSITIVE|NEGATIVE|BOUNDARY|
-        SECURITY|RBAC; priority: P0|P1|P2; id_glob like 'TC-ORD-*'; endpoint like 'POST /v1/orders'."""
+        SECURITY|RBAC; priority: P0|P1|P2; id_glob like 'TC-ORD-*'; endpoint like 'POST /v1/orders'; actor: used by
+        the case or one of its steps; path: part of a step's URL, e.g. '/admin/'; text: part of the title."""
         f = {
             "module": module,
             "status": status,
@@ -122,6 +167,9 @@ def build_agent() -> Agent[ChatDeps, str]:
             "tag": tag,
             "id": id_glob,
             "endpoint": endpoint,
+            "actor": actor,
+            "path": path,
+            "text": text,
         }
         traced("list_test_cases", {k: v for k, v in f.items() if v}, ctx)
         return _dump(await stats.list_cases(ctx.deps.client, f))
@@ -174,17 +222,6 @@ def build_agent() -> Agent[ChatDeps, str]:
     @agent.tool
     async def query_gel(ctx: RunContext[ChatDeps], edgeql: str) -> str:
         """Run ONE read-only EdgeQL select query (fallback when no typed tool fits). Max 200 rows."""
-        q = guard_query(edgeql)
-        traced("query_gel", {}, ctx, q)
-        try:
-            raw = await asyncio.wait_for(db.readonly_query(ctx.deps.client, q), QUERY_TIMEOUT_S)
-        except gel.errors.EdgeDBError as exc:
-            raise ModelRetry(f"Query failed: {exc}") from exc
-        except TimeoutError as exc:
-            raise ModelRetry("Query timed out; make it more selective.") from exc
-        rows = json.loads(raw)
-        if isinstance(rows, list) and len(rows) > MAX_ROWS:
-            return _dump(rows[:MAX_ROWS]) + f" ...({len(rows) - MAX_ROWS} more rows not shown)"
-        return _dump(rows)
+        return await run_query(ctx.deps, edgeql)
 
     return agent

@@ -104,6 +104,15 @@ async def list_cases(client: gel.AsyncIOExecutor, filters: dict[str, Any] | None
            and ((<optional str>$tag in array_unpack(.tags)) ?? true)
            and ((.test_id like <optional str>$id_like) ?? true)
            and (exists (select .endpoints filter .key = <optional str>$endpoint) if exists <optional str>$endpoint else true)
+           and (
+               (.actor.name ?= <optional str>$actor or exists (select .steps filter .actor_name = <optional str>$actor))
+               if exists <optional str>$actor else true
+           )
+           and (
+               exists (select .steps filter .path ilike '%' ++ <optional str>$path ++ '%')
+               if exists <optional str>$path else true
+           )
+           and ((.title ilike '%' ++ <optional str>$text ++ '%') ?? true)
         order by .test_module.code then .test_id
         """,
         module=f.get("module") or None,
@@ -113,6 +122,22 @@ async def list_cases(client: gel.AsyncIOExecutor, filters: dict[str, Any] | None
         tag=f.get("tag") or None,
         id_like=(f.get("id") or "").replace("*", "%").replace("?", "_") or None,
         endpoint=f.get("endpoint") or None,
+        actor=f.get("actor") or None,
+        path=f.get("path") or None,
+        text=f.get("text") or None,
+    )
+    return json.loads(raw)
+
+
+async def list_modules(client: gel.AsyncIOExecutor) -> list[dict[str, Any]]:
+    raw = await client.query_json(
+        f"""
+        select TestModule {{
+            code, folder, domain, base_path, actors: {{ name }},
+            active_cases := count((select .test_cases filter {ACTIVE})),
+        }}
+        order by .code
+        """
     )
     return json.loads(raw)
 

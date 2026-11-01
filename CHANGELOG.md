@@ -1,5 +1,20 @@
 # Changelog
 
+## v0.4.4 — 2026-11-01
+
+QA chat keeps its messages when you switch pages, and bad database queries no longer end an answer.
+
+### Added
+- QA chat: `list_modules` tool, and `list_test_cases` filters by actor, URL path and title text.
+
+### Fixed
+- QA chat messages were cleared on every page change. They are now kept per browser tab, and the `clear` button removes them. An answer interrupted by leaving the page is marked as interrupted.
+- QA chat failed with `Tool 'query_gel' exceeded max retries` after a few invalid queries. Query errors now go back to the model, which is told to stop querying and answer with what it has after 6 failures.
+
+### Known limits
+- The model can still write invalid queries, so some answers use all 6 attempts.
+- Tool results are cut at 30,000 characters, so long case lists can be incomplete.
+
 ## v0.4.3 — 2026-11-01
 
 Requirements now link to the documents they really cite, and QA chat answers no longer disappear after a tool call.

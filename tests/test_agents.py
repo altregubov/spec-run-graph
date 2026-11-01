@@ -2,6 +2,7 @@
 
 import asyncio
 
+import gel
 import pytest
 from pydantic_ai import Agent, ModelRetry
 from pydantic_ai.messages import ToolReturnPart
@@ -10,7 +11,7 @@ from pydantic_ai.models.function import DeltaToolCall, FunctionModel
 from fake_llm import synthesizer_model, tool_model
 from helpers import orders_analysis, orders_specs, reference_module
 from spec_run_graph.agents import analyzer, planner, synthesizer
-from spec_run_graph.agents.chatbot import guard_query, stream_answer
+from spec_run_graph.agents.chatbot import MAX_FAILED_QUERIES, ChatDeps, guard_query, run_query, stream_answer
 from spec_run_graph.domain.ir import ValidationContext
 from spec_run_graph.engines.bruno.naming import plan_files
 
@@ -165,3 +166,20 @@ def test_chat_streams_the_answer_after_a_tool_call():
 
     assert "".join(asyncio.run(collect())) == "Looking it up.\n\nthe answer"
     assert any(isinstance(p, ToolReturnPart) for m in saved for p in m.parts)
+
+
+def test_chat_query_errors_do_not_end_the_answer(monkeypatch):
+    async def broken(client, query):
+        raise gel.errors.InvalidTypeError("bad types")
+
+    monkeypatch.setattr("spec_run_graph.agents.chatbot.db.readonly_query", broken)
+    deps = ChatDeps(client=None)
+
+    async def attempts():
+        return [await run_query(deps, "select TestCase") for _ in range(MAX_FAILED_QUERIES)]
+
+    answers = asyncio.run(attempts())
+    assert all("bad types" in a for a in answers)
+    assert "Stop querying" not in answers[0]
+    assert "Stop querying" in answers[-1]
+    assert "read-only" in asyncio.run(run_query(deps, "delete TestCase"))
